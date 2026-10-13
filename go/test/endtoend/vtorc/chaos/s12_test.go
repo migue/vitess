@@ -431,8 +431,21 @@ func s12b(t *testing.T, name string, lagApplier bool) {
 		r2 := s.node("zone3-0000000300")
 		s.ensurePrimary(p)
 		s.setRecoveries(false)
-		s.R.outcome("P=%s R1=%s (restarted, promoted) R2=%s (behind, vttablet stopped during ERS stop phase) lagApplier=%v", p.Tablet.Alias, r1.Tablet.Alias, r2.Tablet.Alias, lagApplier)
+		// How R1's applier is delayed (S12b2). The delay must never start R1's receiver: delayApplier
+		// starts a stopped receiver to apply SOURCE_DELAY, which would revive R1's ACKs inside the
+		// ERS window. "skip-if-io-stopped" (default) applies it after R1's restart only if R1's
+		// receiver is running. "prefault" applies it before the fault, while R1 replicates; then
+		// R1's relay log holds unapplied pre-fault transactions at ERS's stop, and ERS times out
+		// waiting for R1 to apply them on both revisions, so the scenario no longer tests T2.
+		delayMode := os.Getenv("S12B2_DELAY_MODE")
+		if delayMode == "" {
+			delayMode = "skip-if-io-stopped"
+		}
+		s.R.outcome("P=%s R1=%s (restarted, promoted) R2=%s (behind, vttablet stopped during ERS stop phase) lagApplier=%v delayMode=%s", p.Tablet.Alias, r1.Tablet.Alias, r2.Tablet.Alias, lagApplier, delayMode)
 		s.Sleep(3*time.Second, "baseline")
+		if lagApplier && delayMode == "prefault" {
+			s.delayApplier(r1, 3600)
+		}
 		if err := s.Net.BlockPorts(r2.Group, p.Tablet.MySQLPort); err != nil {
 			t.Fatal(err)
 		}
@@ -454,8 +467,12 @@ func s12b(t *testing.T, name string, lagApplier bool) {
 		s.restartVttablet(r1)
 		d, ok := s.WaitFor("R1 replicating from P after vttablet restart", 10*time.Second, func() bool { return s.replicatingFrom(r1, p) })
 		s.R.outcome("R1 repointed to P by its restarted vttablet: %v (after %.1fs)", ok, d.Seconds())
-		if lagApplier {
-			s.delayApplier(r1, 3600)
+		if lagApplier && delayMode != "prefault" {
+			if s.ioRunning(r1) == "Yes" {
+				s.delayApplier(r1, 3600)
+			} else {
+				s.R.outcome("R1's receiver is not running after the restart: SOURCE_DELAY not applied")
+			}
 		}
 		// Keep R2's stop RPC pending, but finish well within ERS's 15s stop-replication timeout.
 		yes0 := s.semiSync(p)

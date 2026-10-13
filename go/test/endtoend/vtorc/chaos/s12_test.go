@@ -349,12 +349,16 @@ func s12Restart(t *testing.T, name string, opts Options) {
 		}
 		s.Log.Add("heal", "R1 -> P mysql reachable again")
 		restartAt := time.Now()
-		s.restartVttablet(r1)
-		d, ok := s.WaitFor("R1 replicating from P after vttablet restart", 15*time.Second, func() bool { return s.replicatingFrom(r1, p) })
-		s.R.outcome("R1 repointed to P by its restarted vttablet: %v (after %.1fs)", ok, d.Seconds())
+		// The applier locks are released on a fixed schedule, s12ApplierRelease after the ERS
+		// started, whether or not R1 repoints, so that ERS's relay-log wait (bounded by
+		// --wait-replicas-timeout, 20s) always has time left to finish.
+		release := s.Fault.Add(s12ApplierRelease)
 		yes0 := s.semiSync(p)
-		s.Sleep(5*time.Second, "R1 acking P while ERS waits")
-		s.R.note("P semi-sync: 5s apart: [%s] -> [%s]", yes0, s.semiSync(p))
+		s.restartVttablet(r1)
+		d, ok := s.WaitFor("R1 replicating from P after vttablet restart", max(time.Until(release), 0), func() bool { return s.replicatingFrom(r1, p) })
+		s.R.outcome("R1 repointed to P by its restarted vttablet: %v (after %.1fs)", ok, d.Seconds())
+		s.Sleep(max(time.Until(release), 0), "R1 acking P while ERS waits, until the fixed applier release")
+		s.R.note("P semi-sync from R1's restart to the applier release: [%s] -> [%s]", yes0, s.semiSync(p))
 		s.relayState(r1, "R1-after-restart")
 		reconnectedAckedUntil := time.Now()
 
@@ -386,6 +390,9 @@ func s12Restart(t *testing.T, name string, opts Options) {
 		s.reportLostTagged("acked after revocation (writers stopped)", tagged)
 	})
 }
+
+// s12ApplierRelease is when S12a/S12c release the held appliers, measured from the ERS start.
+const s12ApplierRelease = 9 * time.Second
 
 func aliases(ns []*Node) []string {
 	var r []string

@@ -257,6 +257,7 @@ type abRun struct {
 	sups              []*Supervisor
 	actionRe          string
 	revokedAt         time.Time
+	revokeTimedOut    bool
 	firstAttempt      time.Time
 	successAt         time.Time
 	barrier           []*sql.Conn
@@ -357,6 +358,7 @@ func (r *abRun) waitRevoked(ns ...*Node) {
 	})
 	if !ok {
 		r.R.violation("HARNESS: the reparent did not stop the receivers of %v", aliases(ns))
+		r.revokeTimedOut = true
 	}
 	r.revokedAt = time.Now()
 }
@@ -470,9 +472,9 @@ func (r *abRun) analyze() {
 				in = true
 			}
 		}
-		counted := in && (r.revokedAt.IsZero() || !at.Before(r.revokedAt))
-		r.R.outcome("OVERLAP %s: %s at %s, revoked at %s, inside a reparent lock hold=%v -> counted=%v", restarted[i].Tablet.Alias, what,
-			at.Format("15:04:05.000"), fmtTime(r.revokedAt), in, counted)
+		counted := in && !r.revokeTimedOut && (r.revokedAt.IsZero() || !at.Before(r.revokedAt))
+		r.R.outcome("OVERLAP %s: %s at %s, revoked at %s (wait timed out=%v), inside a reparent lock hold=%v -> counted=%v", restarted[i].Tablet.Alias, what,
+			at.Format("15:04:05.000"), fmtTime(r.revokedAt), r.revokeTimedOut, in, counted)
 		if !counted {
 			r.R.violation("HARNESS: %s's restart did not overlap a reparent's lock hold after revocation; do not count this run", restarted[i].Tablet.Alias)
 		}

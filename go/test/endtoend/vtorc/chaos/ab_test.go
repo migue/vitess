@@ -248,23 +248,38 @@ func initAttempts(logFile string) []time.Time {
 	return r
 }
 
-// initAcquiredBetween reports whether a restarted tablet's replication initialization acquired
-// the shard lock between from and to.
-func (r *abRun) initAcquiredBetween(from, to time.Time) bool {
-	re := regexp.MustCompile(`Unlocking shard \S+ for successful action initialize replication`)
+// initRefusedByReparent reports whether the initialization attempt that logFile shows at at was
+// refused because the shard lock was held, and no restarted tablet's initialization held the
+// lock then (so the holder was the reparent).
+func (r *abRun) initRefusedByReparent(logFile string, at time.Time) bool {
+	outcome := regexp.MustCompile(`another operation holds the shard lock|Unlocking shard \S+ for successful action initialize replication`)
+	l := logMatches([]string{logFile}, outcome, at)
+	if len(l) == 0 || !strings.Contains(l[0].Text, "another operation holds the shard lock") {
+		return false
+	}
+	lockRe := regexp.MustCompile(`Locking shard \S+ for action initialize replication`)
+	okRe := regexp.MustCompile(`Unlocking shard \S+ for successful action initialize replication`)
 	for _, sv := range r.sups {
 		for _, g := range sv.Generations() {
-			if g.N == 0 {
+			if g.N == 0 || g.Log == logFile {
 				continue
 			}
-			for _, l := range logMatches([]string{g.Log}, re, from) {
-				if !l.T.After(to) {
-					return true
+			// Pair each acquisition (its successful unlock) with the lock request before it.
+			locks := logMatches([]string{g.Log}, lockRe, time.Time{})
+			for _, u := range logMatches([]string{g.Log}, okRe, time.Time{}) {
+				var from time.Time
+				for _, lk := range locks {
+					if !lk.T.After(u.T) {
+						from = lk.T
+					}
+				}
+				if !from.IsZero() && !at.Before(from) && !at.After(u.T) {
+					return false
 				}
 			}
 		}
 	}
-	return false
+	return true
 }
 
 // reportErrantSettled is reportErrantDetail once no replica has GTIDs of the primary's own
@@ -507,7 +522,7 @@ func (r *abRun) analyze() {
 		if ia := initAttempts(gens[1].Log); len(ia) > 0 {
 			at, what = ia[0], "generation 1 initialization lock request"
 		}
-		in, held := false, true
+		in := false
 		for _, a := range attempts {
 			end := a.Unlock
 			if end.IsZero() {
@@ -515,12 +530,14 @@ func (r *abRun) analyze() {
 			}
 			if !at.Before(a.Lock) && !at.After(end) {
 				in = true
-				// The unlock line comes late when the lock's lease expired, and the lock is gone
-				// once a restarted tablet's initialization acquires it.
-				if strings.Contains(a.Err, "lease") || r.initAcquiredBetween(a.Lock, end) {
-					held = false
-				}
 			}
+		}
+		// The unlock line comes late when the lock's lease expired, so the lock hold seen in the
+		// log is not proof: the attempt must have been refused, and not by another restarted
+		// tablet's initialization.
+		held := true
+		if len(initAttempts(gens[1].Log)) > 0 {
+			held = r.initRefusedByReparent(gens[1].Log, at)
 		}
 		counted := in && held && !r.revokeTimedOut && (r.revokedAt.IsZero() || !at.Before(r.revokedAt))
 		r.R.outcome("OVERLAP %s: %s at %s, revoked at %s (wait timed out=%v), inside a reparent lock hold=%v (lock still held=%v) -> counted=%v", restarted[i].Tablet.Alias, what,

@@ -1,0 +1,57 @@
+From e89bcff72e6340b21c14cc12ed174434fbfa584a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Miguel=20=C3=81ngel=20Pastor=20Olivar?=
+ <migue@planetscale.com>
+Date: Fri, 16 Oct 2026 18:03:52 +0200
+Subject: [PATCH 5/8] tabletmanager: keep UndoDemotePrimary from serving a
+ deferred replica
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+UndoDemotePrimary enables query service directly. On a tablet that is not
+a primary while replication initialization is deferred, that bypassed the
+serving gate. Leave query service to the gate in that case.
+
+Signed-off-by: Miguel Ángel Pastor Olivar <migue@planetscale.com>
+---
+ .../tabletmanager/replication_initialization_test.go   | 10 ++++++++++
+ go/vt/vttablet/tabletmanager/rpc_replication.go        |  5 +++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/go/vt/vttablet/tabletmanager/replication_initialization_test.go b/go/vt/vttablet/tabletmanager/replication_initialization_test.go
+index 63e531df3a..615d01c639 100644
+--- a/go/vt/vttablet/tabletmanager/replication_initialization_test.go
++++ b/go/vt/vttablet/tabletmanager/replication_initialization_test.go
+@@ -2137,3 +2137,13 @@ func TestFinalCheckCoversTheOldApplier(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestUndoDemotePrimaryKeepsDeferredReplicaOutOfRotation(t *testing.T) {
++	tm, md, _, qsc, _ := newPendingReplicationTM(t)
++	tm._waitForGrantsComplete = make(chan struct{})
++	close(tm._waitForGrantsComplete)
++	md.ExpectedExecuteSuperQueryList = nil
++	require.NoError(t, tm.UndoDemotePrimary(t.Context(), false))
++	assert.True(t, tm.tmState.replicationInitPending())
++	assert.False(t, qsc.IsServing())
++}
+diff --git a/go/vt/vttablet/tabletmanager/rpc_replication.go b/go/vt/vttablet/tabletmanager/rpc_replication.go
+index 8bd065bb24..391768f278 100644
+--- a/go/vt/vttablet/tabletmanager/rpc_replication.go
++++ b/go/vt/vttablet/tabletmanager/rpc_replication.go
+@@ -882,6 +882,11 @@ func (tm *TabletManager) UndoDemotePrimary(ctx context.Context, semiSync bool) e
+ 		return err
+ 	}
+ 
++	// A replica whose replication initialization is deferred does not serve
++	// until it completes.
++	if tablet.Type != topodatapb.TabletType_PRIMARY && tm.tmState.replicationInitPending() {
++		return nil
++	}
+ 	// Update serving graph
+ 	log.Info("UndoDemotePrimary re-enabling query service")
+ 	if err := tm.QueryServiceControl.SetServingType(tablet.Type, protoutil.TimeFromProto(tablet.PrimaryTermStartTime).UTC(), true, ""); err != nil {
+-- 
+2.54.0 (Apple Git-157)
+

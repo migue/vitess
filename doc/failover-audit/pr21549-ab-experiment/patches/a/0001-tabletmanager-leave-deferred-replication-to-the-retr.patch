@@ -1,0 +1,256 @@
+From f4e8fa53ddde59e7d302186017d8789e1184d38b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Miguel=20=C3=81ngel=20Pastor=20Olivar?=
+ <migue@planetscale.com>
+Date: Fri, 16 Oct 2026 17:11:23 +0200
+Subject: [PATCH 1/8] tabletmanager: leave deferred replication to the retry
+ after an offline backup
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The cleanup of an offline backup repoints replication to the shard record's
+primary without the shard lock. While replication initialization was
+deferred, setReplicationSourceLocked started replication even though the
+cleanup passes forceStartReplication=false, so it could start a receiver
+that a reparent had stopped, from a primary that the reparent was
+replacing. It also recorded that primary as the chosen source, so the
+retry then waited for it.
+
+Start replication for a pending deferral only in the SetReplicationSource
+RPC, and make the cleanup restore the tablet type and leave replication to
+the retry while a deferral is pending.
+
+Signed-off-by: Miguel Ángel Pastor Olivar <migue@planetscale.com>
+---
+ .../replication_initialization_test.go        | 84 ++++++++++++++++++-
+ go/vt/vttablet/tabletmanager/rpc_backup.go    | 13 +--
+ .../vttablet/tabletmanager/rpc_replication.go | 14 ++--
+ go/vt/vttablet/tabletmanager/tm_state.go      | 15 +++-
+ 4 files changed, 106 insertions(+), 20 deletions(-)
+
+diff --git a/go/vt/vttablet/tabletmanager/replication_initialization_test.go b/go/vt/vttablet/tabletmanager/replication_initialization_test.go
+index ccda2d842a..5d7410de3d 100644
+--- a/go/vt/vttablet/tabletmanager/replication_initialization_test.go
++++ b/go/vt/vttablet/tabletmanager/replication_initialization_test.go
+@@ -1587,6 +1587,7 @@ func (d *blockingDemotionDaemon) SetSuperReadOnly(ctx context.Context, on bool,
+ // the shard primary as the replication source after waiting: an offline
+ // backup when it finishes, and the shard sync of a demoted primary after the
+ // demotion. A source that an RPC chose while they waited must stay recorded.
++// The backup leaves a pending deferral to the retry, so it does not repoint.
+ func TestInternalRepointDoesNotReplaceNewerSource(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		name string
+@@ -1594,6 +1595,8 @@ func TestInternalRepointDoesNotReplaceNewerSource(t *testing.T) {
+ 		// that releases it, and the operation's result.
+ 		start func(t *testing.T, tm *TabletManager, md *mysqlctl.FakeMysqlDaemon) (chan struct{}, <-chan error)
+ 		err   string
++		// queries are the replication commands that the operation runs.
++		queries []string
+ 	}{
+ 		{name: "offline backup", err: "backup failed", start: func(t *testing.T, tm *TabletManager, md *mysqlctl.FakeMysqlDaemon) (chan struct{}, <-chan error) {
+ 			tm.Cnf = &mysqlctl.Mycnf{}
+@@ -1614,7 +1617,7 @@ func TestInternalRepointDoesNotReplaceNewerSource(t *testing.T) {
+ 			<-storage.entered
+ 			return storage.release, finished
+ 		}},
+-		{name: "shard sync demotion", start: func(t *testing.T, tm *TabletManager, md *mysqlctl.FakeMysqlDaemon) (chan struct{}, <-chan error) {
++		{name: "shard sync demotion", queries: []string{"FAKE SET SOURCE", "START REPLICA"}, start: func(t *testing.T, tm *TabletManager, md *mysqlctl.FakeMysqlDaemon) (chan struct{}, <-chan error) {
+ 			require.NoError(t, tm.tmState.ChangeTabletType(t.Context(), topodatapb.TabletType_PRIMARY, DBActionNone))
+ 			d := &blockingDemotionDaemon{FakeMysqlDaemon: md, entered: make(chan struct{}), release: make(chan struct{})}
+ 			tm.MysqlDaemon = d
+@@ -1626,9 +1629,7 @@ func TestInternalRepointDoesNotReplaceNewerSource(t *testing.T) {
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			tm, md, _, qsc, id, newPrimary := newSourceChoiceTM(t)
+-			// Both operations repoint the replica at the old primary that the
+-			// shard record names.
+-			md.ExpectedExecuteSuperQueryList = []string{"FAKE SET SOURCE", "START REPLICA"}
++			md.ExpectedExecuteSuperQueryList = tc.queries
+ 			release, finished := tc.start(t, tm, md)
+ 
+ 			// While the operation waits, an RPC chooses the new primary and
+@@ -1904,3 +1905,78 @@ func TestRestoreDiscardsSourceChosenBeforeRestore(t *testing.T) {
+ 		})
+ 	}
+ }
++
++// TestOfflineBackupLeavesDeferredReplicationToTheRetry checks that the cleanup
++// of an offline backup, which does not hold the shard lock, neither starts a
++// receiver that a reparent stopped nor chooses the source from the shard record
++// while replication initialization is deferred. Without a deferral, it keeps
++// a stopped receiver stopped, as before.
++func TestOfflineBackupLeavesDeferredReplicationToTheRetry(t *testing.T) {
++	for _, pending := range []bool{false, true} {
++		for _, outcome := range []string{"success", "engine failure", "builtin failure"} {
++			name := "no deferral/" + outcome
++			if pending {
++				name = "deferral/" + outcome
++			}
++			t.Run(name, func(t *testing.T) {
++				tm, md, ts, qsc, id, _ := newSourceChoiceTM(t)
++				if !pending {
++					tm.tmState.cancelReplicationInit(t.Context())
++				}
++				tm.Cnf = &mysqlctl.Mycnf{DataDir: t.TempDir() + "/missing", InnodbDataHomeDir: t.TempDir() + "/missing"}
++				md.Running, md.Replicating, md.IOThreadRunning = true, false, true
++				md.CurrentSourceHost, md.CurrentSourcePort = "old-primary", 3306
++				md.ExpectedExecuteSuperQueryList = []string{"STOP REPLICA", "START REPLICA"}
++				if outcome == "builtin failure" {
++					md.ExpectedExecuteSuperQueryList = append([]string{"STOP REPLICA"}, md.ExpectedExecuteSuperQueryList...)
++				}
++				// A reparent has stopped this receiver and still holds the
++				// shard lock.
++				holdInitializationShardLock(t, ts)
++				const storageName = "offline-backup-test-storage"
++				storage := &mysqlctl.FakeBackupStorage{}
++				storage.WithParamsReturn = storage
++				storage.StartBackupReturn.BackupHandle = &mysqlctl.FakeBackupHandle{NameV: "offline"}
++				previousStorage := backupstorage.BackupStorageImplementation
++				backupstorage.BackupStorageImplementation = storageName
++				backupstorage.BackupStorageMap[storageName] = storage
++				t.Cleanup(func() {
++					backupstorage.BackupStorageImplementation = previousStorage
++					delete(backupstorage.BackupStorageMap, storageName)
++				})
++
++				engineName := "builtin"
++				var engine *mysqlctl.FakeBackupEngine
++				if outcome != "builtin failure" {
++					engineName = "offline-backup-test-engine"
++					engine = &mysqlctl.FakeBackupEngine{ShouldDrainForBackupReturn: true}
++					engine.ExecuteBackupReturn.Res = mysqlctl.BackupUsable
++					if outcome == "engine failure" {
++						engine.ExecuteBackupReturn.Res = mysqlctl.BackupUnusable
++						engine.ExecuteBackupReturn.Err = errors.New("engine failure")
++					}
++					mysqlctl.BackupRestoreEngineMap[engineName] = engine
++					t.Cleanup(func() { delete(mysqlctl.BackupRestoreEngineMap, engineName) })
++				}
++				err := tm.Backup(t.Context(), logutil.NewMemoryLogger(), &tabletmanagerdatapb.BackupRequest{BackupEngine: &engineName})
++				switch outcome {
++				case "success":
++					require.NoError(t, err)
++				case "engine failure":
++					require.ErrorContains(t, err, "engine failure")
++				case "builtin failure":
++					require.ErrorContains(t, err, "can't find files to backup")
++				}
++				if engine != nil {
++					require.Len(t, engine.ExecuteBackupCalls, 1)
++				}
++				assert.False(t, md.Replicating, "backup cleanup started a receiver that a reparent stopped")
++				if pending {
++					chosen, _ := tm.tmState.chosenReplicationSource(id)
++					assert.Nil(t, chosen, "backup cleanup chose the source from the shard record")
++					assert.False(t, qsc.IsServing())
++				}
++			})
++		}
++	}
++}
+diff --git a/go/vt/vttablet/tabletmanager/rpc_backup.go b/go/vt/vttablet/tabletmanager/rpc_backup.go
+index cb690fb716..5a1c873dcb 100644
+--- a/go/vt/vttablet/tabletmanager/rpc_backup.go
++++ b/go/vt/vttablet/tabletmanager/rpc_backup.go
+@@ -118,9 +118,6 @@ func (tm *TabletManager) Backup(ctx context.Context, logger logutil.Logger, req
+ 			return err
+ 		}
+ 		defer tm.unlock()
+-		// The source chosen after the backup must not replace one that a
+-		// request made while the backup ran.
+-		sourceTicket := tm.tmState.newReplicationTicket()
+ 
+ 		tablet, err := tm.TopoServer.GetTablet(ctx, tm.tabletAlias)
+ 		if err != nil {
+@@ -155,6 +152,13 @@ func (tm *TabletManager) Backup(ctx context.Context, logger logutil.Logger, req
+ 			if mysqlctl.DisableActiveReparents || tabletInfo.Type == topodatapb.TabletType_PRIMARY {
+ 				return
+ 			}
++			// The deferred initialization chooses the source under the shard
++			// lock, which this does not hold. No deferral can start while the
++			// backup holds the action lock.
++			if tm.tmState.replicationInitPending() {
++				l.Infof("Leaving replication to the deferred replication initialization")
++				return
++			}
+ 
+ 			shardPrimary, err := topotools.GetShardPrimaryForTablet(bgCtx, tm.TopoServer, tablet.Tablet)
+ 			if err != nil {
+@@ -177,8 +181,7 @@ func (tm *TabletManager) Backup(ctx context.Context, logger logutil.Logger, req
+ 				l.Errorf("Failed to convert bool to semisync action, error: %v", err)
+ 				return
+ 			}
+-			tm.tmState.replicationSourceChosen(shardPrimary.Alias, sourceTicket)
+-			if err := tm.setReplicationSourceLocked(bgCtx, shardPrimary.Alias, sourceTicket, 0, "", false, semiSyncAction, 0); err != nil {
++			if err := tm.setReplicationSourceLocked(bgCtx, shardPrimary.Alias, 0, 0, "", false, semiSyncAction, 0); err != nil {
+ 				l.Errorf("Failed to set replication source, error: %v", err)
+ 			}
+ 		}()
+diff --git a/go/vt/vttablet/tabletmanager/rpc_replication.go b/go/vt/vttablet/tabletmanager/rpc_replication.go
+index 5af4cb192e..8bd065bb24 100644
+--- a/go/vt/vttablet/tabletmanager/rpc_replication.go
++++ b/go/vt/vttablet/tabletmanager/rpc_replication.go
+@@ -941,6 +941,13 @@ func (tm *TabletManager) SetReplicationSource(ctx context.Context, parentAlias *
+ 	}
+ 	defer tm.unlock()
+ 	tm.tmState.replicationSourceChosen(parentAlias, ticket)
++	// Replication that vttablet has not initialized yet was not stopped on
++	// purpose unless a request stopped it, so start it. Otherwise nothing
++	// would, and the deferred initialization would keep the replica out of
++	// rotation.
++	if tm.tmState.replicationNeedsStart() {
++		forceStartReplication = true
++	}
+ 
+ 	semiSyncAction, err := tm.convertBoolToSemiSyncAction(ctx, semiSync)
+ 	if err != nil {
+@@ -1012,13 +1019,6 @@ func (tm *TabletManager) setReplicationSourceLocked(ctx context.Context, parentA
+ 	if forceStartReplication {
+ 		shouldbeReplicating = true
+ 	}
+-	// Replication that vttablet has not initialized yet was not stopped on
+-	// purpose unless a request stopped it, so start it. Otherwise nothing
+-	// would, and the deferred initialization would keep the replica out of
+-	// rotation.
+-	if tm.tmState.replicationNeedsStart() {
+-		shouldbeReplicating = true
+-	}
+ 
+ 	// If using semi-sync, we need to enable it before connecting to primary.
+ 	// If we are currently PRIMARY, assume we are about to become REPLICA.
+diff --git a/go/vt/vttablet/tabletmanager/tm_state.go b/go/vt/vttablet/tabletmanager/tm_state.go
+index eb158e2df9..8e7c2fd5d8 100644
+--- a/go/vt/vttablet/tabletmanager/tm_state.go
++++ b/go/vt/vttablet/tabletmanager/tm_state.go
+@@ -395,10 +395,9 @@ func (ts *tmState) requestReplicationSource(source *topodatapb.TabletAlias) uint
+ 	return ts.replicationSourceTickets
+ }
+ 
+-// newReplicationTicket returns a ticket for an operation that will choose a
+-// replication source it does not know yet, or stop or start replication. The
+-// operation calls it when it starts, so that requests arriving while it runs
+-// are newer.
++// newReplicationTicket returns a ticket for a request that stops or starts
++// replication. The request calls it when it arrives, so that requests arriving
++// later are newer.
+ func (ts *tmState) newReplicationTicket() uint64 {
+ 	return ts.requestReplicationSource(nil)
+ }
+@@ -423,6 +422,14 @@ func (ts *tmState) replicationStoppedOnRequest() bool {
+ 	return ts.pendingReplicationInit != 0 && ts.replicationInitStopped
+ }
+ 
++// replicationInitPending reports whether a deferred replication
++// initialization is pending.
++func (ts *tmState) replicationInitPending() bool {
++	ts.mu.Lock()
++	defer ts.mu.Unlock()
++	return ts.pendingReplicationInit != 0
++}
++
+ // replicationNeedsStart reports whether replication must be started because
+ // vttablet has not initialized it and no request has stopped it.
+ func (ts *tmState) replicationNeedsStart() bool {
+-- 
+2.54.0 (Apple Git-157)
+

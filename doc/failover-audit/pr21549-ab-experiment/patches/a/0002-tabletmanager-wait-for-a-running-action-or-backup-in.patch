@@ -1,0 +1,95 @@
+From 10ac521035479c15f67301cc54fcd76dbbd9038f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Miguel=20=C3=81ngel=20Pastor=20Olivar?=
+ <migue@planetscale.com>
+Date: Fri, 16 Oct 2026 17:33:23 +0200
+Subject: [PATCH 2/8] tabletmanager: wait for a running action or backup in the
+ deferred retry
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The retry treated a busy action lock as an error, which doubles its backoff
+up to a minute, and during an offline backup took the shard lock on each
+attempt only to find the action lock held. Report both as waits, so the
+retry checks again within a second, and wait for an offline backup without
+taking the shard lock, as for a restore.
+
+Signed-off-by: Miguel Ángel Pastor Olivar <migue@planetscale.com>
+---
+ .../replication_initialization_test.go        | 24 +++++++++++++++++++
+ go/vt/vttablet/tabletmanager/tm_init.go       | 13 ++++++----
+ 2 files changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/go/vt/vttablet/tabletmanager/replication_initialization_test.go b/go/vt/vttablet/tabletmanager/replication_initialization_test.go
+index 5d7410de3d..6837b981a3 100644
+--- a/go/vt/vttablet/tabletmanager/replication_initialization_test.go
++++ b/go/vt/vttablet/tabletmanager/replication_initialization_test.go
+@@ -1980,3 +1980,27 @@ func TestOfflineBackupLeavesDeferredReplicationToTheRetry(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestDeferredRetryWaitsForActions(t *testing.T) {
++	t.Run("offline backup", func(t *testing.T) {
++		tm, md, _, _, id := newPendingReplicationTM(t)
++		md.ExpectedExecuteSuperQueryList = nil
++		require.NoError(t, tm.lock(t.Context()))
++		defer tm.unlock()
++		require.NoError(t, tm.changeTypeLocked(t.Context(), topodatapb.TabletType_BACKUP, DBActionNone, SemiSyncActionNone))
++		err := tm.retryReplicationInitializationOnce(t.Context(), id)
++		_, waiting := errors.AsType[*replicationInitWaitError](err)
++		assert.True(t, waiting, "%v", err)
++		assert.ErrorContains(t, err, "waiting for the backup to finish")
++	})
++	t.Run("another action", func(t *testing.T) {
++		tm, md, _, _, id := newPendingReplicationTM(t)
++		md.ExpectedExecuteSuperQueryList = nil
++		require.NoError(t, tm.lock(t.Context()))
++		defer tm.unlock()
++		err := tm.retryReplicationInitializationOnce(t.Context(), id)
++		_, waiting := errors.AsType[*replicationInitWaitError](err)
++		assert.True(t, waiting, "%v", err)
++		assert.ErrorContains(t, err, "another action is running")
++	})
++}
+diff --git a/go/vt/vttablet/tabletmanager/tm_init.go b/go/vt/vttablet/tabletmanager/tm_init.go
+index 84a212848f..a625629a12 100644
+--- a/go/vt/vttablet/tabletmanager/tm_init.go
++++ b/go/vt/vttablet/tabletmanager/tm_init.go
+@@ -1284,7 +1284,7 @@ func (tm *TabletManager) attemptDeferredReplicationInit(ctx context.Context, id
+ 	// RPCs can change replication once the tablet serves them. Do not wait for
+ 	// one while holding the shard lock.
+ 	if !tm.actionSema.TryAcquire(1) {
+-		return vterrors.New(vtrpc.Code_UNAVAILABLE, "another action is running on this tablet")
++		return &replicationInitWaitError{"another action is running on this tablet"}
+ 	}
+ 	defer tm.unlock()
+ 	if done, err := tm.settleDeferredReplicationInit(ctx, id); done || err != nil {
+@@ -1339,10 +1339,10 @@ func (tm *TabletManager) endCheckedReplicationInit(id, ticket uint64) error {
+ // settleDeferredReplicationInit reports whether the deferred replication
+ // initialization id has ended without needing a replication change: it is no
+ // longer pending, or the tablet has become a primary, which ends it. While a
+-// restore runs, or while replication is stopped on request, it returns a
+-// *replicationInitWaitError. It changes no
+-// replication, so it needs no lock, and ending the deferral is safe because
+-// only this ID is ended.
++// restore or an offline backup runs, or while replication is stopped on
++// request, it returns a *replicationInitWaitError. It changes no replication,
++// so it needs no lock, and ending the deferral is safe because only this ID is
++// ended.
+ func (tm *TabletManager) settleDeferredReplicationInit(ctx context.Context, id uint64) (bool, error) {
+ 	// Read the ticket before the type: an RPC that chooses a source also
+ 	// demotes a primary, and the deferral must not then end without checking
+@@ -1360,6 +1360,9 @@ func (tm *TabletManager) settleDeferredReplicationInit(ctx context.Context, id u
+ 		// A restore that finishes supersedes this initialization. One that
+ 		// aborts leaves the data, and this initialization, unchanged.
+ 		return false, &replicationInitWaitError{"waiting for the restore to finish"}
++	case topodatapb.TabletType_BACKUP:
++		// An offline backup holds the action lock until it finishes.
++		return false, &replicationInitWaitError{"waiting for the backup to finish"}
+ 	}
+ 	if tm.tmState.replicationStoppedOnRequest() {
+ 		// Do not undo the stop. Initialization resumes once a request starts
+-- 
+2.54.0 (Apple Git-157)
+

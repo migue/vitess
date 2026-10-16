@@ -1,0 +1,67 @@
+From 359b377b85e1d8aa03558eba1874768fdaab1bdf Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Miguel=20=C3=81ngel=20Pastor=20Olivar?=
+ <migue@planetscale.com>
+Date: Sat, 17 Oct 2026 00:34:45 +0200
+Subject: [PATCH 8/8] tabletmanager: keep replication stopped after
+ ResetReplicationParameters
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ResetReplicationParameters stops replication and clears its source, but did
+not record the stop the way the other stop requests do, so a pending
+deferral's retry configured the shard primary and started replication again
+right after it.
+
+Signed-off-by: Miguel Ángel Pastor Olivar <migue@planetscale.com>
+---
+ .../tabletmanager/replication_initialization_test.go         | 5 ++++-
+ go/vt/vttablet/tabletmanager/rpc_replication.go              | 2 ++
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/go/vt/vttablet/tabletmanager/replication_initialization_test.go b/go/vt/vttablet/tabletmanager/replication_initialization_test.go
+index 18f71b2473..9fa3a85a3e 100644
+--- a/go/vt/vttablet/tabletmanager/replication_initialization_test.go
++++ b/go/vt/vttablet/tabletmanager/replication_initialization_test.go
+@@ -1715,6 +1715,9 @@ func stopReplicationOnRequest(t *testing.T, tm *TabletManager, md *mysqlctl.Fake
+ 	case "ResetReplication":
+ 		md.ExpectedExecuteSuperQueryList = []string{"FAKE RESET ALL REPLICATION"}
+ 		require.NoError(t, tm.ResetReplication(t.Context()))
++	case "ResetReplicationParameters":
++		md.ExpectedExecuteSuperQueryList = []string{"STOP REPLICA", "FAKE RESET REPLICA ALL"}
++		require.NoError(t, tm.ResetReplicationParameters(t.Context()))
+ 	}
+ 	require.NoError(t, md.CheckSuperQueryList())
+ 	// The fake does not stop replication for the last two.
+@@ -1723,7 +1726,7 @@ func stopReplicationOnRequest(t *testing.T, tm *TabletManager, md *mysqlctl.Fake
+ }
+ 
+ func TestDeferredInitializationKeepsReplicationStoppedOnRequest(t *testing.T) {
+-	for _, stop := range []string{"StopReplication", "StopReplicationMinimum", "StartReplicationUntilAfter", "ResetReplication"} {
++	for _, stop := range []string{"StopReplication", "StopReplicationMinimum", "StartReplicationUntilAfter", "ResetReplication", "ResetReplicationParameters"} {
+ 		t.Run(stop, func(t *testing.T) {
+ 			tm, md, qsc, id := newReplicatingPendingTM(t)
+ 			stopReplicationOnRequest(t, tm, md, stop)
+diff --git a/go/vt/vttablet/tabletmanager/rpc_replication.go b/go/vt/vttablet/tabletmanager/rpc_replication.go
+index 391768f278..75df7234fd 100644
+--- a/go/vt/vttablet/tabletmanager/rpc_replication.go
++++ b/go/vt/vttablet/tabletmanager/rpc_replication.go
+@@ -911,6 +911,7 @@ func (tm *TabletManager) ReplicaWasPromoted(ctx context.Context) error {
+ // ResetReplicationParameters resets the replica replication parameters
+ func (tm *TabletManager) ResetReplicationParameters(ctx context.Context) error {
+ 	log.Info("ResetReplicationParameters")
++	ticket := tm.tmState.newReplicationTicket()
+ 	if err := tm.waitForGrantsToHaveApplied(ctx); err != nil {
+ 		return err
+ 	}
+@@ -928,6 +929,7 @@ func (tm *TabletManager) ResetReplicationParameters(ctx context.Context) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	tm.tmState.replicationRunRequested(ticket, false)
+ 	return nil
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

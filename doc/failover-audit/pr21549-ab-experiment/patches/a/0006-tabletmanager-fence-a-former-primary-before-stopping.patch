@@ -1,0 +1,159 @@
+From 00f22582b89a0d2845a2309d8067029a5d25813a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Miguel=20=C3=81ngel=20Pastor=20Olivar?=
+ <migue@planetscale.com>
+Date: Fri, 16 Oct 2026 18:35:10 +0200
+Subject: [PATCH 6/8] tabletmanager: fence a former primary before stopping its
+ applier
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Initialization stopped replication before the fence. With source-side
+semi-sync on, as on a former primary or after a stale UndoDemotePrimary,
+the applier's commit can wait for acknowledgements, and STOP REPLICA waits
+for that commit. Only the fence, which disables source-side semi-sync,
+releases it, so the stop failed and every attempt repeated it.
+
+Fence first, then stop replication, then run the final errant GTID check.
+
+Signed-off-by: Miguel Ángel Pastor Olivar <migue@planetscale.com>
+---
+ .../replication_initialization_test.go        | 72 ++++++++++++++++++-
+ go/vt/vttablet/tabletmanager/tm_init.go       | 17 +++--
+ 2 files changed, 79 insertions(+), 10 deletions(-)
+
+diff --git a/go/vt/vttablet/tabletmanager/replication_initialization_test.go b/go/vt/vttablet/tabletmanager/replication_initialization_test.go
+index 615d01c639..18f71b2473 100644
+--- a/go/vt/vttablet/tabletmanager/replication_initialization_test.go
++++ b/go/vt/vttablet/tabletmanager/replication_initialization_test.go
+@@ -1242,8 +1242,8 @@ func newFormerPrimaryTM(t *testing.T, running bool, commitGTID string) (*TabletM
+ 	return tm, d, qsc, id
+ }
+ 
+-// configuringStops returns the replication commands of n attempts that fail
+-// after stopping replication before their final check. Attempts that find
++// configuringStops returns the replication commands of n attempts that fence
++// and stop replication, and then fail their final check. Attempts that find
+ // replication running run no command.
+ func configuringStops(running bool, n int) []string {
+ 	if running {
+@@ -1305,7 +1305,8 @@ func TestFailedFenceIsRepeatedByTheNextAttempt(t *testing.T) {
+ 		} {
+ 			t.Run(path.name+"/"+tc.name, func(t *testing.T) {
+ 				tm, md, qsc, id := newFormerPrimaryTM(t, path.running, ",8bc65c84-3fe4-11ed-a912-257f0fcdd6c9:1")
+-				md.ExpectedExecuteSuperQueryList = configuringStops(path.running, 2)
++				// Only the second attempt, whose fence succeeds, stops replication.
++				md.ExpectedExecuteSuperQueryList = configuringStops(path.running, 1)
+ 				tc.setup(md)
+ 
+ 				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+@@ -2147,3 +2148,68 @@ func TestUndoDemotePrimaryKeepsDeferredReplicaOutOfRotation(t *testing.T) {
+ 	assert.True(t, tm.tmState.replicationInitPending())
+ 	assert.False(t, qsc.IsServing())
+ }
++
++// semiSyncBlockedApplier models an applier whose commit waits for semi-sync
++// acknowledgements while source-side semi-sync is on. STOP REPLICA waits for
++// that commit, as MySQL does.
++type semiSyncBlockedApplier struct {
++	*mysqlctl.FakeMysqlDaemon
++	stoppedWhileBlocked bool
++}
++
++func (d *semiSyncBlockedApplier) StopReplication(ctx context.Context, hookExtraEnv map[string]string) error {
++	if d.SemiSyncPrimaryEnabled {
++		d.stoppedWhileBlocked = true
++		<-ctx.Done()
++		return ctx.Err()
++	}
++	return d.FakeMysqlDaemon.StopReplication(ctx, hookExtraEnv)
++}
++
++// TestFenceReleasesTheApplierBeforeStopping covers a replica with source-side
++// semi-sync on, as a stale UndoDemotePrimary leaves it, whose applier waits
++// for acknowledgements. Each path must disable source-side semi-sync before
++// it waits for the applier to stop.
++func TestFenceReleasesTheApplierBeforeStopping(t *testing.T) {
++	for _, path := range []string{"startup", "retry", "retry on a chosen source", "retry already running"} {
++		t.Run(path, func(t *testing.T) {
++			tm, md, _, qsc, id := newPendingReplicationTM(t)
++			tm._waitForGrantsComplete = make(chan struct{})
++			close(tm._waitForGrantsComplete)
++			md.Replicating, md.IOThreadRunning, md.SemiSyncReplicaEnabled = true, true, true
++			md.CurrentSourceHost, md.CurrentSourcePort = "stale-primary", 3306
++			md.ExpectedExecuteSuperQueryList = nil
++			require.NoError(t, tm.UndoDemotePrimary(t.Context(), true))
++			require.True(t, md.SemiSyncPrimaryEnabled)
++			daemon := &semiSyncBlockedApplier{FakeMysqlDaemon: md}
++			tm.MysqlDaemon = daemon
++			md.ExpectedExecuteSuperQueryList = []string{"STOP REPLICA", "FAKE SET SOURCE", "START REPLICA"}
++			switch path {
++			case "startup":
++				tm.tmState.cancelReplicationInit(t.Context())
++			case "retry on a chosen source":
++				tm.tmState.requestReplicationSource(&topodatapb.TabletAlias{Cell: "cell1", Uid: 2})
++			case "retry already running":
++				md.CurrentSourceHost = "old-primary"
++				md.ExpectedExecuteSuperQueryList = nil
++			}
++			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
++			defer cancel()
++			var err error
++			if path == "startup" {
++				_, err = tm.initializeReplication(ctx, topodatapb.TabletType_REPLICA)
++			} else {
++				err = tm.retryReplicationInitializationOnce(ctx, id)
++			}
++			require.NoError(t, err)
++			assert.False(t, daemon.stoppedWhileBlocked, "replication was stopped while its applier waited for acknowledgements")
++			assert.False(t, md.SemiSyncPrimaryEnabled)
++			assert.True(t, md.SuperReadOnly.Load())
++			assert.True(t, md.Replicating)
++			if path != "startup" {
++				assert.True(t, qsc.IsServing())
++			}
++			require.NoError(t, md.CheckSuperQueryList())
++		})
++	}
++}
+diff --git a/go/vt/vttablet/tabletmanager/tm_init.go b/go/vt/vttablet/tabletmanager/tm_init.go
+index bc78068679..e1869d923a 100644
+--- a/go/vt/vttablet/tabletmanager/tm_init.go
++++ b/go/vt/vttablet/tabletmanager/tm_init.go
+@@ -1585,7 +1585,8 @@ const fenceRevertTimeout = 2 * time.Second
+ // fenceFormerPrimary fences writes on a mysqld with source-side semi-sync
+ // enabled, as a former primary has. Its commits waiting for acknowledgements
+ // reach gtid_executed only once released, so when it returns true the caller
+-// must repeat its errant GTID check.
++// must repeat its errant GTID check. The applier's commits can wait too, so
++// a caller that stops replication must fence first.
+ func (tm *TabletManager) fenceFormerPrimary(ctx context.Context) (_ bool, err error) {
+ 	source, replica, err := tm.MysqlDaemon.ReadSemiSyncEnabled(ctx)
+ 	if err != nil || !source {
+@@ -1718,15 +1719,17 @@ func (tm *TabletManager) initializeReplicationLocked(ctx context.Context, tablet
+ 	if err := topo.CheckShardLocked(ctx, tablet.Keyspace, tablet.Shard); err != nil {
+ 		return "", err
+ 	}
+-	// Check again once nothing else can commit: STOP REPLICA waits for the
+-	// applier's transaction in progress, and the fence for a former
+-	// primary's commits.
+-	if err := tm.MysqlDaemon.StopReplication(ctx, tm.hookExtraEnv()); err != nil {
+-		return "", vterrors.Wrap(err, "failed to stop replication")
+-	}
++	// Check again once nothing else can commit: the fence waits for a
++	// former primary's commits, and STOP REPLICA for the applier's
++	// transaction in progress. Fence first, because with source-side
++	// semi-sync on, the applier's commit can itself wait for
++	// acknowledgements until the fence disables it.
+ 	if _, err := tm.fenceFormerPrimary(ctx); err != nil {
+ 		return "", err
+ 	}
++	if err := tm.MysqlDaemon.StopReplication(ctx, tm.hookExtraEnv()); err != nil {
++		return "", vterrors.Wrap(err, "failed to stop replication")
++	}
+ 	if primaryStatus, err = tm.checkNoErrantGTIDs(ctx, currentPrimary.Tablet); err != nil {
+ 		return "", err
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

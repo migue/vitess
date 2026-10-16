@@ -1,0 +1,219 @@
+From da2bb05d1cca94d22ba3db5cb58b4135570cd89b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Miguel=20=C3=81ngel=20Pastor=20Olivar?=
+ <migue@planetscale.com>
+Date: Fri, 16 Oct 2026 17:33:46 +0200
+Subject: [PATCH 3/8] tabletmanager: configure a chosen source that the shard
+ record names
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Once a request chose a source, the retry only waited for replication to
+run from it. If the request failed before starting replication, or timed
+out on a restore's action lock after which the restore reset replication,
+nothing configured that source again, and the replica stayed NOT_SERVING
+until another request came.
+
+When replication does not run from the chosen source and the shard record
+names it, initialize replication from it under the shard lock, with
+initialization's checks. If the record names another tablet, keep waiting,
+so that a stale record never replaces the choice.
+
+Signed-off-by: Miguel Ángel Pastor Olivar <migue@planetscale.com>
+---
+ .../replication_initialization_test.go        | 67 +++++++++++++++++--
+ go/vt/vttablet/tabletmanager/tm_init.go       | 39 +++++++++--
+ 2 files changed, 95 insertions(+), 11 deletions(-)
+
+diff --git a/go/vt/vttablet/tabletmanager/replication_initialization_test.go b/go/vt/vttablet/tabletmanager/replication_initialization_test.go
+index 6837b981a3..5150b772ae 100644
+--- a/go/vt/vttablet/tabletmanager/replication_initialization_test.go
++++ b/go/vt/vttablet/tabletmanager/replication_initialization_test.go
+@@ -881,8 +881,15 @@ func TestSourceOnlyRPCStartsDeferredReplication(t *testing.T) {
+ 			require.NoError(t, md.CheckSuperQueryList())
+ 			if tc.startErr != nil {
+ 				require.ErrorContains(t, err, "cannot start replication")
+-				require.ErrorContains(t, tm.retryReplicationInitializationOnce(t.Context(), id), "(old-primary:3306), which a reparent or VTOrc chose")
+ 				assert.False(t, qsc.IsServing(), "a replica whose replication is stopped must not serve")
++				// The shard record names the chosen source, so the retry
++				// configures it once starting works.
++				md.StartReplicationError = nil
++				md.ExpectedExecuteSuperQueryList = []string{"STOP REPLICA", "FAKE SET SOURCE", "START REPLICA"}
++				md.ExpectedExecuteSuperQueryCurrent = 0
++				require.NoError(t, tm.retryReplicationInitializationOnce(t.Context(), id))
++				require.NoError(t, md.CheckSuperQueryList())
++				assert.True(t, qsc.IsServing())
+ 				return
+ 			}
+ 			require.NoError(t, err)
+@@ -986,7 +993,10 @@ func TestDeferredReplicationRetryEnablesServingAfterReleasingLocks(t *testing.T)
+ 	assert.True(t, qsc.IsServing())
+ }
+ 
+-func TestFailedReparentSourceKeepsReplicaOutOfRotation(t *testing.T) {
++// TestRetryConfiguresSourceAFailedReparentChose checks that a replica whose
++// RPC failed to install its source does not serve, and that the retry
++// configures that source once the shard record names it.
++func TestRetryConfiguresSourceAFailedReparentChose(t *testing.T) {
+ 	for _, tc := range []struct {
+ 		name  string
+ 		setup func(md *mysqlctl.FakeMysqlDaemon)
+@@ -1026,12 +1036,17 @@ func TestFailedReparentSourceKeepsReplicaOutOfRotation(t *testing.T) {
+ 			require.Error(t, tc.rpc(t.Context(), tm, newPrimary.Alias))
+ 			assert.Equal(t, "old-primary", md.CurrentSourceHost)
+ 
+-			// Replication runs, but not from the source the RPC chose.
+-			md.ExpectedExecuteSuperQueryList = nil
++			assert.False(t, qsc.IsServing(), "a replica must not serve from a source other than the one the RPC chose")
++
++			// Replication runs, but not from the source the RPC chose. The
++			// shard record names that source, so the retry configures it.
++			md.SetReplicationSourceError = nil
++			md.ExpectedExecuteSuperQueryList = []string{"STOP REPLICA", "FAKE SET SOURCE", "START REPLICA"}
+ 			md.ExpectedExecuteSuperQueryCurrent = 0
+-			require.ErrorContains(t, tm.retryReplicationInitializationOnce(t.Context(), id), "(new-primary:3306), which a reparent or VTOrc chose")
++			require.NoError(t, tm.retryReplicationInitializationOnce(t.Context(), id))
+ 			require.NoError(t, md.CheckSuperQueryList())
+-			assert.False(t, qsc.IsServing(), "a replica must not serve from a source other than the one the RPC chose")
++			assert.Equal(t, "new-primary", md.CurrentSourceHost)
++			assert.True(t, qsc.IsServing())
+ 		})
+ 	}
+ }
+@@ -1981,6 +1996,30 @@ func TestOfflineBackupLeavesDeferredReplicationToTheRetry(t *testing.T) {
+ 	}
+ }
+ 
++func TestRetryConfiguresShardPrimaryChosenDuringRestore(t *testing.T) {
++	for _, rpc := range sourceChoosingRPCs {
++		t.Run(rpc.name, func(t *testing.T) {
++			tm, md, ts, qsc, _, _ := newSourceChoiceTM(t)
++			tm.tmState.cancelReplicationInit(t.Context())
++			shardPrimary := &topodatapb.TabletAlias{Cell: "cell1", Uid: 2}
++			id := finishRestoreUnderShardLock(t, tm, md, ts, func() {
++				// A reparent's RPC to the shard primary times out waiting for
++				// the restore's action lock, and so never configures it.
++				ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
++				defer cancel()
++				require.ErrorIs(t, rpc.call(ctx, tm, shardPrimary), context.DeadlineExceeded)
++			})
++			md.ExpectedExecuteSuperQueryList = []string{"STOP REPLICA", "FAKE SET SOURCE", "START REPLICA"}
++			md.ExpectedExecuteSuperQueryCurrent = 0
++			require.NoError(t, tm.retryReplicationInitializationOnce(t.Context(), id))
++			require.NoError(t, md.CheckSuperQueryList())
++			assert.Equal(t, "old-primary", md.CurrentSourceHost)
++			assert.True(t, md.Replicating)
++			assert.True(t, qsc.IsServing())
++		})
++	}
++}
++
+ func TestDeferredRetryWaitsForActions(t *testing.T) {
+ 	t.Run("offline backup", func(t *testing.T) {
+ 		tm, md, _, _, id := newPendingReplicationTM(t)
+@@ -2004,3 +2043,19 @@ func TestDeferredRetryWaitsForActions(t *testing.T) {
+ 		assert.ErrorContains(t, err, "another action is running")
+ 	})
+ }
++
++// TestInitializationConfiguresOnlyTheChosenSource covers a shard record that
++// stops naming the chosen source after the retry checked it without the shard
++// lock.
++func TestInitializationConfiguresOnlyTheChosenSource(t *testing.T) {
++	tm, md, _, _, _, newPrimary := newSourceChoiceTM(t)
++	md.ExpectedExecuteSuperQueryList = nil
++	ctx, unlock, err := tm.lockReplicationInitialization(t.Context())
++	require.NoError(t, err)
++	defer unlock(&err)
++	// The shard record names the old primary.
++	_, err = tm.initializeReplicationLocked(ctx, topodatapb.TabletType_REPLICA, newPrimary.Alias)
++	require.ErrorIs(t, err, errShardPrimaryNotChosen)
++	require.NoError(t, md.CheckSuperQueryList())
++	assert.False(t, md.Replicating)
++}
+diff --git a/go/vt/vttablet/tabletmanager/tm_init.go b/go/vt/vttablet/tabletmanager/tm_init.go
+index a625629a12..6934a3044b 100644
+--- a/go/vt/vttablet/tabletmanager/tm_init.go
++++ b/go/vt/vttablet/tabletmanager/tm_init.go
+@@ -1294,10 +1294,16 @@ func (tm *TabletManager) attemptDeferredReplicationInit(ctx context.Context, id
+ 	ctx, cancel := context.WithTimeout(ctx, topo.RemoteOperationTimeout)
+ 	defer cancel()
+ 	var primary *topodatapb.Tablet
++	var waitErr error
+ 	alias, ticket := tm.tmState.chosenReplicationSource(id)
+ 	if alias != nil {
+-		// Never replace a source that an RPC chose.
+-		if primary, err = tm.replicatingChosenSource(ctx, alias); err != nil {
++		// Never replace a source that an RPC chose. If replication does not
++		// run from it, initialize it below, but only if the shard record
++		// names it.
++		primary, err = tm.replicatingChosenSource(ctx, alias)
++		if _, waiting := errors.AsType[*replicationInitWaitError](err); waiting {
++			waitErr = err
++		} else if err != nil {
+ 			return err
+ 		}
+ 	} else if primary, err = tm.replicatingShardPrimary(ctx); err != nil {
+@@ -1313,7 +1319,10 @@ func (tm *TabletManager) attemptDeferredReplicationInit(ctx context.Context, id
+ 			return err
+ 		}
+ 	} else {
+-		primaryPos, err := tm.initializeReplicationLocked(ctx, tm.Tablet().Type)
++		primaryPos, err := tm.initializeReplicationLocked(ctx, tm.Tablet().Type, alias)
++		if errors.Is(err, errShardPrimaryNotChosen) {
++			return waitErr
++		}
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -1397,6 +1406,10 @@ func (tm *TabletManager) completeChosenReplicationSource(ctx context.Context, id
+ 	ctx, cancel := context.WithTimeout(ctx, topo.RemoteOperationTimeout)
+ 	defer cancel()
+ 	primary, err := tm.replicatingChosenSource(ctx, alias)
++	if _, waiting := errors.AsType[*replicationInitWaitError](err); waiting && tm.shardPrimaryIs(ctx, alias) {
++		// Initialization can configure the chosen source under the shard lock.
++		return false, nil
++	}
+ 	if err != nil {
+ 		return false, err
+ 	}
+@@ -1639,18 +1652,34 @@ func (tm *TabletManager) initializeReplication(ctx context.Context, tabletType t
+ 	defer unlock(&err)
+ 	ctx, cancel := context.WithTimeout(ctx, topo.RemoteOperationTimeout)
+ 	defer cancel()
+-	return tm.initializeReplicationLocked(ctx, tabletType)
++	return tm.initializeReplicationLocked(ctx, tabletType, nil)
++}
++
++// errShardPrimaryNotChosen reports that the shard record does not name the
++// source that initialization was asked to configure.
++var errShardPrimaryNotChosen = vterrors.New(vtrpc.Code_UNAVAILABLE, "the shard record does not name the chosen replication source")
++
++// shardPrimaryIs reports whether the shard record names alias as the primary.
++func (tm *TabletManager) shardPrimaryIs(ctx context.Context, alias *topodatapb.TabletAlias) bool {
++	tablet := tm.Tablet()
++	si, err := tm.TopoServer.GetShard(ctx, tablet.Keyspace, tablet.Shard)
++	return err == nil && topoproto.TabletAliasEqual(si.PrimaryAlias, alias)
+ }
+ 
+ // initializeReplicationLocked runs with the shard lock held from source selection
+ // through receiver startup, so it cannot undo a reparent's receiver revocation.
+-func (tm *TabletManager) initializeReplicationLocked(ctx context.Context, tabletType topodatapb.TabletType) (string, error) {
++// If source is set, it returns errShardPrimaryNotChosen unless the shard record
++// names source, before it changes anything.
++func (tm *TabletManager) initializeReplicationLocked(ctx context.Context, tabletType topodatapb.TabletType, source *topodatapb.TabletAlias) (string, error) {
+ 	tablet := tm.Tablet()
+ 	// Read the shard to find the current primary, and its location.
+ 	si, err := tm.TopoServer.GetShard(ctx, tablet.Keyspace, tablet.Shard)
+ 	if err != nil {
+ 		return "", vterrors.Wrap(err, "cannot read shard")
+ 	}
++	if source != nil && !topoproto.TabletAliasEqual(si.PrimaryAlias, source) {
++		return "", errShardPrimaryNotChosen
++	}
+ 	if si.PrimaryAlias == nil {
+ 		// There's no primary. This is fine, since there might be no primary currently
+ 		log.Warn(fmt.Sprintf("cannot start replication during initialization: shard %v/%v has no primary.", tablet.Keyspace, tablet.Shard))
+-- 
+2.54.0 (Apple Git-157)
+

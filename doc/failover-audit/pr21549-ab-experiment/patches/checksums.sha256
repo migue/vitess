@@ -1,0 +1,9 @@
+248d432da86ffe972cf0d3f59719e80f11812e8fd7aac77812958dea62bb32c1  a/0001-tabletmanager-leave-deferred-replication-to-the-retr.patch
+c424b3c50060275c6cbdf34e492408dc6b75d8b9bd6cb7ea04e9be8759131144  a/0002-tabletmanager-wait-for-a-running-action-or-backup-in.patch
+58cb595d82bf461eb5862f5fa4b179a3023bdb1fa1981d74bb0563e31b1a2062  a/0003-tabletmanager-configure-a-chosen-source-that-the-sha.patch
+cfb07edb811d2c517b0497870cdba100b58a21491c7c7928b02a7a4a2edbdaf7  a/0004-tabletmanager-stop-the-old-applier-before-the-final-.patch
+3df7aca9728443a5b6cc4641e594eca66dd16bcb05625b1c2ab84a09581f1d38  a/0005-tabletmanager-keep-UndoDemotePrimary-from-serving-a-.patch
+b5e1570bfb0072a3d7f285ee27f71915c50dd59ef08d9492668cca01d9b48974  a/0006-tabletmanager-fence-a-former-primary-before-stopping.patch
+b14803b2547e4938ab56e049a2b9476502ba07149f52016553f0e24efb7297c8  a/0007-mysqlctl-stop-waiting-for-a-closed-connection-s-repl.patch
+cadfcafac19bc8f787e4f2dc86b3fb6ba7407eae4ffb001278ec60a45a07bcd2  a/0008-tabletmanager-keep-replication-stopped-after-ResetRe.patch
+451e839a33793faf7460e78ed91200f3e16a82827925a6bc96ee2c20cf992293  b/0001-PROTOTYPE-B-fail-instead-of-deferring-when-the-shard.patch

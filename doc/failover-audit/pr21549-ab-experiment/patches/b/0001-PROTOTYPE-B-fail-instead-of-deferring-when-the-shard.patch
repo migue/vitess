@@ -1,0 +1,161 @@
+From 0244696de16ed08b0c94c360662533fddb1d7d0a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Miguel=20=C3=81ngel=20Pastor=20Olivar?=
+ <migue@planetscale.com>
+Date: Sat, 17 Oct 2026 00:41:06 +0200
+Subject: [PATCH] PROTOTYPE (B): fail instead of deferring when the shard lock
+ is held
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+For measuring design B against A in the chaos harness; not for review.
+Startup returns the error, so vttablet exits; a restore fails and the tablet
+stays RESTORE. A restart that skips the restore because mysqld already has
+data initializes replication, as a start without a restore does. The
+deferral machinery stays in the code but is never entered.
+
+Signed-off-by: Miguel Ángel Pastor Olivar <migue@planetscale.com>
+---
+ go/vt/vttablet/tabletmanager/restore.go       |  7 ++
+ .../startup_exit_on_lock_test.go              | 84 +++++++++++++++++++
+ go/vt/vttablet/tabletmanager/tm_init.go       | 12 +--
+ 3 files changed, 95 insertions(+), 8 deletions(-)
+ create mode 100644 go/vt/vttablet/tabletmanager/startup_exit_on_lock_test.go
+
+diff --git a/go/vt/vttablet/tabletmanager/restore.go b/go/vt/vttablet/tabletmanager/restore.go
+index 4145124c51..422fe4af77 100644
+--- a/go/vt/vttablet/tabletmanager/restore.go
++++ b/go/vt/vttablet/tabletmanager/restore.go
+@@ -611,6 +611,13 @@ func (rt *restoreStateManager) start(ctx context.Context) (bool, error) {
+ 	}
+ 	if !ok {
+ 		rt.logger.Infof("Attempting to restore, but mysqld already contains data. Assuming vttablet was just restarted.")
++		// A restart can follow a restore that failed to initialize replication,
++		// so initialize it as a start without a restore does.
++		if !rt.deleteBeforeRestore {
++			if _, err := rt.tm.initializeReplicationUnlessShardLocked(ctx, rt.logger, rt.tm.Tablet().Type); err != nil {
++				return false, vterrors.Wrap(err, "failed to initialize replication")
++			}
++		}
+ 		return false, nil
+ 	}
+ 
+diff --git a/go/vt/vttablet/tabletmanager/startup_exit_on_lock_test.go b/go/vt/vttablet/tabletmanager/startup_exit_on_lock_test.go
+new file mode 100644
+index 0000000000..28fffb9412
+--- /dev/null
++++ b/go/vt/vttablet/tabletmanager/startup_exit_on_lock_test.go
+@@ -0,0 +1,84 @@
++/*
++Copyright 2026 The Vitess Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package tabletmanager
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"vitess.io/vitess/go/vt/logutil"
++	"vitess.io/vitess/go/vt/mysqlctl"
++	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
++)
++
++func TestStartupFailsWhileTheShardIsLocked(t *testing.T) {
++	tm, md, ts, _ := newReplicationInitializationTM(t)
++	holdInitializationShardLock(t, ts)
++	md.ExpectedExecuteSuperQueryList = nil
++
++	_, err := tm.initializeReplicationUnlessShardLocked(t.Context(), logutil.NewMemoryLogger(), topodatapb.TabletType_REPLICA)
++	_, unavailable := errors.AsType[*shardLockUnavailableError](err)
++	assert.True(t, unavailable, "err=%v", err)
++	assert.False(t, tm.tmState.replicationInitPending(), "nothing retries in the background")
++	assert.False(t, md.Replicating)
++}
++
++func TestRestartAfterRestoreInitializesReplication(t *testing.T) {
++	tm, md, _, _ := newReplicationInitializationTM(t)
++	tm.Cnf = &mysqlctl.Mycnf{}
++
++	// mysqld already has the restored data, so the restore is skipped.
++	started, err := tm.newRestoreStateManager(logutil.NewMemoryLogger(), false).start(t.Context())
++	require.NoError(t, err)
++	assert.False(t, started)
++	require.NoError(t, md.CheckSuperQueryList(), "the restart initializes replication")
++	assert.True(t, md.Replicating)
++	assert.Equal(t, "old-primary", md.CurrentSourceHost)
++}
++
++func TestRestartAfterRestoreFailsWhileTheShardIsLocked(t *testing.T) {
++	tm, md, ts, _ := newReplicationInitializationTM(t)
++	tm.Cnf = &mysqlctl.Mycnf{}
++	holdInitializationShardLock(t, ts)
++	md.ExpectedExecuteSuperQueryList = nil
++
++	_, err := tm.newRestoreStateManager(logutil.NewMemoryLogger(), false).start(t.Context())
++	require.ErrorContains(t, err, "cannot initialize replication for ks/0")
++	assert.False(t, md.Replicating)
++}
++
++func TestRestoreFailsWhileTheShardIsLocked(t *testing.T) {
++	tm, md, ts, _ := newReplicationInitializationTM(t)
++	tm.Cnf = &mysqlctl.Mycnf{}
++	require.NoError(t, tm.tmState.ChangeTabletType(t.Context(), topodatapb.TabletType_RESTORE, DBActionNone))
++	holdInitializationShardLock(t, ts)
++
++	md.ExpectedExecuteSuperQueryList = []string{"STOP REPLICA", "FAKE RESET REPLICA ALL"}
++	rsm := tm.newRestoreStateManager(logutil.NewMemoryLogger(), true)
++	rsm.state = restoreStarted
++	rsm.prevTabletType, rsm.nextTabletType = topodatapb.TabletType_REPLICA, topodatapb.TabletType_REPLICA
++	pos := md.GetPrimaryPositionLocked()
++	err := rsm.finish(t.Context(), replicationCommand{action: replicationActionStart, position: &pos})
++	require.ErrorContains(t, err, "cannot initialize replication for ks/0")
++	require.NoError(t, md.CheckSuperQueryList())
++	assert.False(t, md.Replicating)
++	assert.Equal(t, topodatapb.TabletType_RESTORE, tm.Tablet().Type, "the tablet stays out of rotation")
++	assert.False(t, tm.tmState.replicationInitPending())
++}
+diff --git a/go/vt/vttablet/tabletmanager/tm_init.go b/go/vt/vttablet/tabletmanager/tm_init.go
+index e1869d923a..539d628b92 100644
+--- a/go/vt/vttablet/tabletmanager/tm_init.go
++++ b/go/vt/vttablet/tabletmanager/tm_init.go
+@@ -1199,17 +1199,13 @@ const (
+ 	replicationInitializationMaxRetryInterval = time.Minute
+ )
+ 
+-// initializeReplicationUnlessShardLocked initializes replication unless the
+-// shard lock is unavailable. In that case replication is left unchanged, and
+-// initialization is retried in the background while non-primary types do not
+-// serve queries.
++// initializeReplicationUnlessShardLocked initializes replication. If the shard
++// lock is unavailable, it returns the error without changing replication: at
++// startup vttablet then exits, and a restore fails, leaving the tablet RESTORE.
+ func (tm *TabletManager) initializeReplicationUnlessShardLocked(ctx context.Context, logger logutil.Logger, tabletType topodatapb.TabletType) (string, error) {
+ 	primaryPos, err := tm.initializeReplication(ctx, tabletType)
+ 	if _, ok := errors.AsType[*shardLockUnavailableError](err); ok {
+-		logger.Warningf("deferring replication initialization, retrying in the background: %v", err)
+-		id := tm.tmState.deferReplicationInit(ctx, err)
+-		go tm.retryReplicationInitialization(tm.tmState.ctx, id)
+-		return "", nil
++		logger.Errorf("cannot initialize replication while another operation holds the shard lock: %v", err)
+ 	}
+ 	return primaryPos, err
+ }
+-- 
+2.54.0 (Apple Git-157)
+

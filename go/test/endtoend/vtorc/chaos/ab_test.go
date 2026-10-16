@@ -248,6 +248,25 @@ func initAttempts(logFile string) []time.Time {
 	return r
 }
 
+// initAcquiredBetween reports whether a restarted tablet's replication initialization acquired
+// the shard lock between from and to.
+func (r *abRun) initAcquiredBetween(from, to time.Time) bool {
+	re := regexp.MustCompile(`Unlocking shard \S+ for successful action initialize replication`)
+	for _, sv := range r.sups {
+		for _, g := range sv.Generations() {
+			if g.N == 0 {
+				continue
+			}
+			for _, l := range logMatches([]string{g.Log}, re, from) {
+				if !l.T.After(to) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // ---- the experiment's run ----
 
 type abRun struct {
@@ -462,7 +481,7 @@ func (r *abRun) analyze() {
 		if ia := initAttempts(gens[1].Log); len(ia) > 0 {
 			at, what = ia[0], "generation 1 initialization lock request"
 		}
-		in := false
+		in, held := false, true
 		for _, a := range attempts {
 			end := a.Unlock
 			if end.IsZero() {
@@ -470,11 +489,16 @@ func (r *abRun) analyze() {
 			}
 			if !at.Before(a.Lock) && !at.After(end) {
 				in = true
+				// The unlock line comes late when the lock's lease expired, and the lock is gone
+				// once a restarted tablet's initialization acquires it.
+				if strings.Contains(a.Err, "lease") || r.initAcquiredBetween(a.Lock, end) {
+					held = false
+				}
 			}
 		}
-		counted := in && !r.revokeTimedOut && (r.revokedAt.IsZero() || !at.Before(r.revokedAt))
-		r.R.outcome("OVERLAP %s: %s at %s, revoked at %s (wait timed out=%v), inside a reparent lock hold=%v -> counted=%v", restarted[i].Tablet.Alias, what,
-			at.Format("15:04:05.000"), fmtTime(r.revokedAt), r.revokeTimedOut, in, counted)
+		counted := in && held && !r.revokeTimedOut && (r.revokedAt.IsZero() || !at.Before(r.revokedAt))
+		r.R.outcome("OVERLAP %s: %s at %s, revoked at %s (wait timed out=%v), inside a reparent lock hold=%v (lock still held=%v) -> counted=%v", restarted[i].Tablet.Alias, what,
+			at.Format("15:04:05.000"), fmtTime(r.revokedAt), r.revokeTimedOut, in, held, counted)
 		if !counted {
 			r.R.violation("HARNESS: %s's restart did not overlap a reparent's lock hold after revocation; do not count this run", restarted[i].Tablet.Alias)
 		}

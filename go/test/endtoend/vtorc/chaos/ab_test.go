@@ -267,6 +267,32 @@ func (r *abRun) initAcquiredBetween(from, to time.Time) bool {
 	return false
 }
 
+// reportErrantSettled is reportErrantDetail once no replica has GTIDs of the primary's own
+// server_uuid that the primary's gtid_executed lacks (at most 10s): with AFTER_SYNC, a write
+// in flight is in the replicas' relay logs before it is in the primary's gtid_executed, and the
+// writers are still running here.
+func (r *abRun) reportErrantSettled() {
+	if p := r.topoPrimary(); p != nil {
+		uuid, _ := p.scalar("select @@global.server_uuid")
+		r.WaitFor("no in-flight primary transactions on the replicas", 10*time.Second, func() bool {
+			pg, err := p.gtidExecuted()
+			if err != nil {
+				return false
+			}
+			for _, n := range r.Nodes {
+				if n == p {
+					continue
+				}
+				if e, _ := n.scalar("select gtid_subtract(@@global.gtid_executed, ?)", pg); uuid != "" && strings.Contains(e, uuid) {
+					return false
+				}
+			}
+			return true
+		})
+	}
+	r.reportErrantDetail("at the end")
+}
+
 // ---- the experiment's run ----
 
 type abRun struct {
@@ -722,7 +748,7 @@ func abERS(t *testing.T, name string, viaVTOrc, restarts bool) {
 		}
 		r.waitConverged(r.firstAttempt, true)
 		r.analyze()
-		s.reportErrantDetail("at the end")
+		r.reportErrantSettled()
 	})
 }
 
@@ -768,7 +794,7 @@ func TestABE2PRS(t *testing.T) {
 		s.R.outcome("topo primary after the PRS: %v; vttablet types: %s", aliasOf(s.topoPrimary()), s.types())
 		r.waitConverged(r.firstAttempt, false)
 		r.analyze()
-		s.reportErrantDetail("at the end")
+		r.reportErrantSettled()
 	})
 }
 
@@ -844,7 +870,7 @@ func TestABE3StartupRestore(t *testing.T) {
 		s.R.outcome("R1 at the end: type=%s replicating from the shard primary %s=%v; %s", s.tabletTypeHTTP(r.r1), aliasOf(tp), tp != nil && s.replicatingFrom(r.r1, tp), sv.Summary())
 		r.successAt = releasedAt
 		r.analyzeRestore(sv)
-		s.reportErrantDetail("at the end")
+		r.reportErrantSettled()
 	})
 }
 

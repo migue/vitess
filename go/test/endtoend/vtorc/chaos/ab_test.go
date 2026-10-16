@@ -646,7 +646,8 @@ func (r *abRun) generationAt(key string, t time.Time) string {
 			continue
 		}
 		for _, g := range sv.Generations() {
-			if g.N > 0 && !t.Before(g.Start) && (g.End.IsZero() || !t.After(g.End)) {
+			// Generation 0 was started by the cluster: its Start is unknown (zero).
+			if !t.Before(g.Start) && (g.End.IsZero() || !t.After(g.End)) {
 				return fmt.Sprintf(" (generation %d)", g.N)
 			}
 		}

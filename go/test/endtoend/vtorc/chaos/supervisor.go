@@ -78,7 +78,9 @@ type Generation struct {
 	End   time.Time `json:",omitzero"`
 	// Induced: the harness killed it (only generation 0, when supervision starts). Every later
 	// generation that ended before the scenario stopped the supervisor exited by itself.
-	Induced  bool
+	Induced bool
+	// Teardown: the harness killed it when the scenario stopped the supervisor; not an exit.
+	Teardown bool   `json:",omitempty"`
 	ExitErr  string `json:",omitempty"`
 	LastLine string `json:",omitempty"`
 	// Delay is how long the supervisor waited before starting this generation.
@@ -205,6 +207,7 @@ func (sv *Supervisor) run() {
 			g.ExitErr = exitErr.Error()
 		}
 		stopped := sv.stopped
+		g.Teardown = stopped
 		sv.mu.Unlock()
 		if stopped {
 			return
@@ -349,7 +352,7 @@ func (sv *Supervisor) Summary() string {
 
 // SelfExits counts the generations that exited by themselves.
 func (sv *Supervisor) SelfExits() int {
-	return len(slices.DeleteFunc(sv.Generations(), func(g Generation) bool { return g.N == 0 || g.End.IsZero() || g.Induced }))
+	return len(slices.DeleteFunc(sv.Generations(), func(g Generation) bool { return g.N == 0 || g.End.IsZero() || g.Induced || g.Teardown }))
 }
 
 // lastErrorLine returns the last error-level line of a Vitess log, shortened.

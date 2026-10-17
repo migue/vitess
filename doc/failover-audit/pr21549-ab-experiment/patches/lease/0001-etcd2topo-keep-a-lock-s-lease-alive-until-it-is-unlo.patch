@@ -1,0 +1,138 @@
+From 555181baab5cf14e30ec7ddb02c2860f3d60a4e4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Miguel=20=C3=81ngel=20Pastor=20Olivar?=
+ <migue@planetscale.com>
+Date: Sat, 17 Oct 2026 12:03:40 +0200
+Subject: [PATCH] etcd2topo: keep a lock's lease alive until it is unlocked
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The lease KeepAlive ran on the context passed to Lock. topo.Server's lock
+functions bound that context to the acquisition and cancel it when the lock
+is acquired, so the KeepAlive stopped right away and the lease expired after
+--topo-etcd-lease-ttl unless the holder called CheckShardLocked or
+CheckKeyspaceLocked in time. A holder that runs longer, such as an
+EmergencyReparentShard waiting for relay logs, lost its lock while still
+acting under it.
+
+Run the KeepAlive on a context detached from the caller's and stop it on
+Unlock or when acquisition fails. Leader election keeps ending it with its
+own context.
+
+Signed-off-by: Miguel Ángel Pastor Olivar <migue@planetscale.com>
+---
+ go/vt/topo/etcd2topo/election.go    |  2 ++
+ go/vt/topo/etcd2topo/lock.go        | 16 +++++++++++++---
+ go/vt/topo/etcd2topo/server_test.go | 17 +++++++++++++++++
+ 3 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/go/vt/topo/etcd2topo/election.go b/go/vt/topo/etcd2topo/election.go
+index 2bbf484ad9..e477402920 100644
+--- a/go/vt/topo/etcd2topo/election.go
++++ b/go/vt/topo/etcd2topo/election.go
+@@ -97,6 +97,8 @@ func (mp *etcdLeaderParticipation) WaitForLeadership() (context.Context, error)
+ 		// It can be that we were interrupted.
+ 		return nil, err
+ 	}
++	// Stop can miss a lock acquired while it runs: end the lease's KeepAlive with lockCtx.
++	context.AfterFunc(lockCtx, ld.(*etcdLockDescriptor).stopKeepAlive)
+ 
+ 	// We got the lock. Return the lockContext. If Stop() is called,
+ 	// it will cancel the lockCtx, and cancel the returned context.
+diff --git a/go/vt/topo/etcd2topo/lock.go b/go/vt/topo/etcd2topo/lock.go
+index 842f53911d..d1b3f8e9ef 100644
+--- a/go/vt/topo/etcd2topo/lock.go
++++ b/go/vt/topo/etcd2topo/lock.go
+@@ -131,6 +131,8 @@ func (s *Server) waitOnLastRev(ctx context.Context, cli *clientv3.Client, nodePa
+ type etcdLockDescriptor struct {
+ 	s       *Server
+ 	leaseID clientv3.LeaseID
++	// stopKeepAlive ends the lease's KeepAlive.
++	stopKeepAlive context.CancelFunc
+ }
+ 
+ // TryLock is part of the topo.Conn interface.
+@@ -202,8 +204,12 @@ func (s *Server) lock(ctx context.Context, nodePath, contents string, ttl int) (
+ 	if err != nil {
+ 		return nil, convertError(err, nodePath)
+ 	}
+-	leaseKA, err := s.cli.KeepAlive(ctx, lease.ID)
++	// The KeepAlive must outlive ctx, which callers often bound to the acquisition: it runs
++	// until Unlock, or until acquisition fails.
++	kaCtx, stopKeepAlive := context.WithCancel(context.WithoutCancel(ctx))
++	leaseKA, err := s.cli.KeepAlive(kaCtx, lease.ID)
+ 	if err != nil {
++		stopKeepAlive()
+ 		return nil, convertError(err, nodePath)
+ 	}
+ 	go func() {
+@@ -216,6 +222,7 @@ func (s *Server) lock(ctx context.Context, nodePath, contents string, ttl int) (
+ 	// Create an ephemeral node in the locks directory.
+ 	key, revision, err := s.newUniqueEphemeralKV(ctx, s.cli, lease.ID, nodePath, contents)
+ 	if err != nil {
++		stopKeepAlive()
+ 		return nil, err
+ 	}
+ 
+@@ -230,13 +237,15 @@ func (s *Server) lock(ctx context.Context, nodePath, contents string, ttl int) (
+ 				log.Warn(fmt.Sprintf("Revoke(%d) failed, may have left %v behind: %v", lease.ID, key, rerr))
+ 			}
+ 			revokeCancel()
++			stopKeepAlive()
+ 			return nil, err
+ 		}
+ 		if done {
+ 			// No more older nodes, we're it!
+ 			return &etcdLockDescriptor{
+-				s:       s,
+-				leaseID: lease.ID,
++				s:             s,
++				leaseID:       lease.ID,
++				stopKeepAlive: stopKeepAlive,
+ 			}, nil
+ 		}
+ 	}
+@@ -254,6 +263,7 @@ func (ld *etcdLockDescriptor) Check(ctx context.Context) error {
+ 
+ // Unlock is part of the topo.LockDescriptor interface.
+ func (ld *etcdLockDescriptor) Unlock(ctx context.Context) error {
++	defer ld.stopKeepAlive()
+ 	_, err := ld.s.cli.Revoke(ctx, ld.leaseID)
+ 	if err != nil {
+ 		return convertError(err, "lease")
+diff --git a/go/vt/topo/etcd2topo/server_test.go b/go/vt/topo/etcd2topo/server_test.go
+index e8e026c5fd..c503382789 100644
+--- a/go/vt/topo/etcd2topo/server_test.go
++++ b/go/vt/topo/etcd2topo/server_test.go
+@@ -28,6 +28,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/stretchr/testify/assert"
+ 	"github.com/stretchr/testify/require"
+ 
+ 	"vitess.io/vitess/go/testfiles"
+@@ -468,4 +469,20 @@ func testKeyspaceLock(t *testing.T, ts *topo.Server) {
+ 	if err := lockDescriptor.Unlock(ctx); err != nil {
+ 		require.NoError(t, err)
+ 	}
++
++	// Short TTL through topo.Server, which ends the acquisition context once the lock is
++	// acquired: the lease must still be kept alive until the unlock.
++	_, unlock, err := ts.LockKeyspace(ctx, "test_keyspace", "short ttl, acquisition context ended")
++	require.NoError(t, err)
++	assert.Never(t, func() bool {
++		ld, err := conn.TryLock(ctx, keyspacePath, "probe")
++		if err != nil {
++			return false
++		}
++		_ = ld.Unlock(ctx)
++		return true
++	}, 5*time.Second, 250*time.Millisecond, "the lock expired while still held")
++	var unlockErr error
++	unlock(&unlockErr)
++	require.NoError(t, unlockErr)
+ }
+-- 
+2.54.0 (Apple Git-157)
+

@@ -7,3 +7,4 @@ b5e1570bfb0072a3d7f285ee27f71915c50dd59ef08d9492668cca01d9b48974  a/0006-tabletm
 b14803b2547e4938ab56e049a2b9476502ba07149f52016553f0e24efb7297c8  a/0007-mysqlctl-stop-waiting-for-a-closed-connection-s-repl.patch
 cadfcafac19bc8f787e4f2dc86b3fb6ba7407eae4ffb001278ec60a45a07bcd2  a/0008-tabletmanager-keep-replication-stopped-after-ResetRe.patch
 451e839a33793faf7460e78ed91200f3e16a82827925a6bc96ee2c20cf992293  b/0001-PROTOTYPE-B-fail-instead-of-deferring-when-the-shard.patch
+583970147334bb49db45c18fad930cea097c5c77a7961d10fad01286c011d668  lease/0001-etcd2topo-keep-a-lock-s-lease-alive-until-it-is-unlo.patch

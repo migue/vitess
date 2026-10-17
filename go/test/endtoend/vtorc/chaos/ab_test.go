@@ -321,7 +321,10 @@ type abRun struct {
 	fixtureInvalid    bool
 	firstAttempt      time.Time
 	successAt         time.Time
-	barrier           []*sql.Conn
+	// promotedAt: the new primary's PromoteReplica in the first successful attempt; phase (d)
+	// starts there. E3 has no promotion and sets it with successAt.
+	promotedAt time.Time
+	barrier    []*sql.Conn
 	// cleanDemotion: the reparent demotes P itself (PRS), so a replica still replicating from P
 	// after the promotion is stale but cannot revive P's writes.
 	cleanDemotion bool
@@ -596,7 +599,15 @@ func (r *abRun) analyze() {
 		r.R.outcome("attempt %s %q lock %s unlock %s ok=%v err=%q", a.Who, a.Action, a.Lock.Format("15:04:05.000"), fmtTime(a.Unlock), a.OK, a.Err)
 		if a.OK && r.successAt.IsZero() {
 			r.successAt = a.Unlock
+			r.promotedAt = r.promotionIn(a)
 		}
+	}
+	if !r.successAt.IsZero() {
+		if r.promotedAt.IsZero() {
+			r.R.violation("HARNESS: no PromoteReplica line in the first successful attempt; phase (d) starts at its unlock")
+			r.promotedAt = r.successAt
+		}
+		r.R.outcome("promotion at %s (%s after the first attempt)", r.promotedAt.Format("15:04:05.000"), sinceFirst(r.firstAttempt, r.promotedAt))
 	}
 	r.R.outcome("reparent attempts=%d failed=%d; time from the first attempt to the first success: %s", len(attempts),
 		len(slices.DeleteFunc(slices.Clone(attempts), func(a reparentAttempt) bool { return a.OK || a.Unlock.IsZero() })), sinceFirst(r.firstAttempt, r.successAt))
@@ -662,7 +673,7 @@ func (r *abRun) analyze() {
 		switch {
 		case !ok || smp.T.Before(rv):
 			ph = "a"
-		case !r.successAt.IsZero() && !smp.T.Before(r.successAt):
+		case !r.promotedAt.IsZero() && !smp.T.Before(r.promotedAt):
 			ph = "d"
 		case inAttempt(attempts, smp.T):
 			ph = "b"
@@ -774,6 +785,31 @@ func (r *abRun) generationAt(key string, t time.Time) string {
 		return " (between generations)"
 	}
 	return ""
+}
+
+// promoteReplicaRe matches the line vttablet logs when PromoteReplica starts. The file:line may
+// be followed by a color reset.
+var promoteReplicaRe = regexp.MustCompile(`rpc_replication\.go:\d+\S* PromoteReplica\s*$`)
+
+// promotionIn returns when a tablet's vttablet logged PromoteReplica during attempt a, or zero.
+func (r *abRun) promotionIn(a reparentAttempt) time.Time {
+	var files []string
+	for _, n := range r.Nodes {
+		files = append(files, n.Tablet.VttabletProcess.ErrorLog)
+	}
+	for _, sv := range r.sups {
+		for _, g := range sv.Generations() {
+			if g.Log != "" {
+				files = append(files, g.Log)
+			}
+		}
+	}
+	for _, l := range logMatches(files, promoteReplicaRe, a.Lock) {
+		if a.Unlock.IsZero() || !l.T.After(a.Unlock) {
+			return l.T
+		}
+	}
+	return time.Time{}
 }
 
 func inAttempt(attempts []reparentAttempt, t time.Time) bool {
@@ -995,7 +1031,7 @@ func TestABE3StartupRestore(t *testing.T) {
 		r.waitConverged(releasedAt, "the harness released the shard lock", false)
 		tp := s.topoPrimary()
 		s.R.outcome("R1 at the end: type=%s replicating from the shard primary %s=%v; %s", s.tabletTypeHTTP(r.r1), aliasOf(tp), tp != nil && s.replicatingFrom(r.r1, tp), sv.Summary())
-		r.successAt = releasedAt
+		r.successAt, r.promotedAt = releasedAt, releasedAt
 		r.analyzeRestore(sv)
 		r.reportErrantSettled()
 	})

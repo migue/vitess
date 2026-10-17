@@ -70,6 +70,12 @@ func TestLogTime(t *testing.T) {
 	assert.Equal(t, 395*time.Millisecond, time.Duration(tm.Nanosecond()))
 }
 
+func TestPromoteReplicaRe(t *testing.T) {
+	assert.True(t, promoteReplicaRe.MatchString("2026-10-17 00:15:06.775 UTC INF tabletmanager/rpc_replication.go:1247 PromoteReplica"))
+	assert.True(t, promoteReplicaRe.MatchString("\x1b[2m2026-10-17 00:15:06.775 CEST\x1b[0m \x1b[92mINF\x1b[0m \x1b[2mtabletmanager/rpc_replication.go:1247\x1b[0m PromoteReplica"))
+	assert.False(t, promoteReplicaRe.MatchString("2026-10-17 00:15:06.776 UTC INF tabletmanager/rpc_server.go:83 TabletManager.PromoteReplica()(on zone2-0000000400 from ): ok"))
+}
+
 // TestSupervisorRestartsExitedGenerations runs a "vttablet" that exits at once: every
 // generation must be restarted after the policy's delay, with its own log, the same command
 // line, and classified as exiting by itself.

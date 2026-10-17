@@ -452,7 +452,15 @@ func (r *abRun) restart(n *Node, restore bool, prepare func(), timeout time.Dura
 // as a REPLICA of it.
 func (r *abRun) abConvergenceProblems(excludeOld bool) []string {
 	if !excludeOld {
-		_, probs := r.convergenceProblems()
+		p, probs := r.convergenceProblems()
+		// The plan's convergence includes serving, which convergenceProblems does not check.
+		for _, n := range r.Nodes {
+			if n != p {
+				if st := tabletState(n); st != "SERVING" {
+					probs = append(probs, fmt.Sprintf("%s %s", n.Tablet.Alias, st))
+				}
+			}
+		}
 		return probs
 	}
 	p := r.topoPrimary()

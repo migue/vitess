@@ -644,7 +644,20 @@ func (r *abRun) analyze() {
 		}
 		prev = a
 	}
-	r.R.outcome("WRITES: %d acked after the fault; longest gap %.1fs from %s", len(acks), gap.Seconds(), gapAt.Format("15:04:05.000"))
+	// The writers run until the scenario ends, so a gap may still be open now.
+	ongoing := ""
+	if now := time.Now(); now.Sub(prev) > gap {
+		gap, gapAt, ongoing = now.Sub(prev), prev, " (still open at the analysis)"
+	}
+	r.R.outcome("WRITES: %d acked after the fault; longest gap %.1fs from %s%s", len(acks), gap.Seconds(), gapAt.Format("15:04:05.000"), ongoing)
+	againAt := "not within the run"
+	for _, a := range acks {
+		if !r.successAt.IsZero() && a.After(r.successAt) {
+			againAt = sinceFirst(r.firstAttempt, a)
+			break
+		}
+	}
+	r.R.outcome("WRITES acknowledged again after the first successful reparent: %s after the first attempt", againAt)
 
 	b, _ := json.MarshalIndent(struct {
 		Fault, FirstAttempt, RevokedAt, SuccessAt time.Time

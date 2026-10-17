@@ -318,6 +318,7 @@ type abRun struct {
 	actionRe          string
 	revokedAt         time.Time
 	revokeTimedOut    bool
+	fixtureInvalid    bool
 	firstAttempt      time.Time
 	successAt         time.Time
 	barrier           []*sql.Conn
@@ -362,17 +363,81 @@ func (r *abRun) releaseBarrier() {
 	r.barrier = nil
 }
 
+// cutFromP cuts the given replicas from P's MySQL port.
+func (r *abRun) cutFromP(ns ...*Node) {
+	for _, n := range ns {
+		if err := r.Net.BlockPorts(n.Group, r.p.Tablet.MySQLPort); err != nil {
+			r.t.Fatal(err)
+		}
+	}
+	r.Log.Add("fault", fmt.Sprintf("cut %v -> P mysql", aliases(ns)))
+}
+
+// receivedSet returns the GTIDs n has executed or received, as an ERS compares them.
+func receivedSet(n *Node) string {
+	ex, _ := n.gtidExecuted()
+	st, _ := n.replicaStatus()
+	rs := strings.ReplaceAll(st["Retrieved_Gtid_Set"], "\n", "")
+	if rs == "" {
+		return ex
+	}
+	u, _ := n.scalar("select gtid_subtract(concat(?, ',', ?), '')", ex, rs)
+	return u
+}
+
+// staggerCut cuts R1 and R2 from P before R3 and R4, once R3 and R4 have received strictly more
+// than R1 and R2. The ERS then leaves R1 and R2 out of its relay-log wait and waits only on R3
+// and R4, which the barrier holds, instead of letting an unbarriered candidate finish first and
+// become an intermediate source. Writes keep flowing in between: R3 and R4 still acknowledge.
+func (r *abRun) staggerCut() {
+	r.cutFromP(r.r1, r.r2)
+	ahead := func() bool {
+		for _, hi := range []*Node{r.r3, r.r4} {
+			h := receivedSet(hi)
+			for _, lo := range []*Node{r.r1, r.r2} {
+				l := receivedSet(lo)
+				if v, _ := hi.scalar("select gtid_subset(?, ?) and not gtid_subset(?, ?)", l, h, h, l); v != "1" {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	if _, ok := r.WaitFor("R3 and R4 received strictly more than R1 and R2", 15*time.Second, ahead); !ok {
+		r.invalid("R3 and R4 did not get strictly ahead of R1 and R2")
+	}
+	r.cutFromP(r.r3, r.r4)
+}
+
+// invalid marks the run as not meeting its fixture: it is reported and not counted.
+func (r *abRun) invalid(why string) {
+	r.fixtureInvalid = true
+	r.R.violation("HARNESS: FIXTURE INVALID: %s; do not count this run", why)
+}
+
+// waitBarrierHolds waits until the ERS waits for the relay logs of R3 or R4, or both (their
+// WaitForPosition), and of neither R1 nor R2: then every candidate it waits for is barriered.
+func (r *abRun) waitBarrierHolds() {
+	wait := regexp.MustCompile(`WaitForPosition: `)
+	logOf := func(n *Node) []string { return []string{n.Tablet.VttabletProcess.ErrorLog} }
+	if _, ok := r.WaitFor("the ERS waits on R3 or R4", 15*time.Second, func() bool {
+		return len(logMatches(logOf(r.r3), wait, r.firstAttempt)) > 0 || len(logMatches(logOf(r.r4), wait, r.firstAttempt)) > 0
+	}); !ok {
+		r.invalid("the ERS did not wait for R3's or R4's relay logs")
+	}
+	// The ERS starts its waits together; give the others time to be logged.
+	r.Sleep(time.Second, "the ERS's other relay-log waits, if any, start")
+	for _, n := range []*Node{r.r1, r.r2} {
+		if len(logMatches(logOf(n), wait, r.firstAttempt)) > 0 {
+			r.invalid(n.Tablet.Alias + " was in the ERS's relay-log wait")
+		}
+	}
+}
+
 // blockPrimary makes P's commits wait for semi-sync acknowledgements by cutting every replica
 // from P's MySQL port.
 func (r *abRun) blockPrimary() {
-	for _, n := range r.Nodes {
-		if n != r.p {
-			if err := r.Net.BlockPorts(n.Group, r.p.Tablet.MySQLPort); err != nil {
-				r.t.Fatal(err)
-			}
-		}
-	}
-	r.Log.Add("fault", "cut every replica -> P mysql (P's commits wait for semi-sync)")
+	r.staggerCut()
 	if _, ok := r.WaitFor("P has commits waiting for semi-sync", 15*time.Second, func() bool {
 		v, _ := strconv.Atoi(r.p.status("Rpl_semi_sync_source_wait_sessions")["Rpl_semi_sync_source_wait_sessions"])
 		return v > 0
@@ -408,7 +473,7 @@ func (r *abRun) startReparent(command string, args ...string) <-chan ersResult {
 
 // waitRevoked waits until the given replicas' receivers are stopped.
 func (r *abRun) waitRevoked(ns ...*Node) {
-	_, ok := r.WaitFor("receivers stopped by the reparent", 60*time.Second, func() bool {
+	_, ok := r.WaitFor("receivers stopped by the reparent", 20*time.Second, func() bool {
 		for _, n := range ns {
 			if r.ioRunning(n) != "No" {
 				return false
@@ -547,9 +612,9 @@ func (r *abRun) analyze() {
 		if len(initAttempts(gens[1].Log)) > 0 {
 			held = r.initRefusedByReparent(gens[1].Log, at)
 		}
-		counted := in && held && !r.revokeTimedOut && (r.revokedAt.IsZero() || !at.Before(r.revokedAt))
-		r.R.outcome("OVERLAP %s: %s at %s, revoked at %s (wait timed out=%v), inside a reparent lock hold=%v (lock still held=%v) -> counted=%v", restarted[i].Tablet.Alias, what,
-			at.Format("15:04:05.000"), fmtTime(r.revokedAt), r.revokeTimedOut, in, held, counted)
+		counted := in && held && !r.revokeTimedOut && !r.fixtureInvalid && (r.revokedAt.IsZero() || !at.Before(r.revokedAt))
+		r.R.outcome("OVERLAP %s: %s at %s, revoked at %s (wait timed out=%v), inside a reparent lock hold=%v (lock still held=%v), fixture invalid=%v -> counted=%v", restarted[i].Tablet.Alias, what,
+			at.Format("15:04:05.000"), fmtTime(r.revokedAt), r.revokeTimedOut, in, held, r.fixtureInvalid, counted)
 		if !counted {
 			r.R.violation("HARNESS: %s's restart did not overlap a reparent's lock hold after revocation; do not count this run", restarted[i].Tablet.Alias)
 		}
@@ -744,8 +809,14 @@ func abERS(t *testing.T, name string, viaVTOrc, restarts bool) {
 			ers = r.startReparent("EmergencyReparentShard", "--new-primary", r.r3.Tablet.Alias, "--wait-replicas-timeout", "120s")
 		}
 		r.waitRevoked(r.r1, r.r2)
+		if restarts && !r.revokeTimedOut {
+			r.waitBarrierHolds()
+		}
 
-		if restarts {
+		if restarts && (r.fixtureInvalid || r.revokeTimedOut) {
+			// Restarting now would not overlap the intended stage of the ERS.
+			r.releaseBarrier()
+		} else if restarts {
 			// A receiver that a restarted tablet starts can reach P again.
 			for _, n := range []*Node{r.r1, r.r2} {
 				if err := s.Net.Unblock(n.Group, r.p.Tablet.MySQLPort); err != nil {

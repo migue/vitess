@@ -550,20 +550,39 @@ func (r *abRun) abConvergenceProblems(excludeOld bool) []string {
 	return probs
 }
 
+// abVerifyWindow is how long the writers keep running after convergence, before the analysis.
+const abVerifyWindow = 10 * time.Second
+
 // waitConverged polls until the cluster has converged or the observation window ends, and
-// reports the result as a duration from the first attempt or as censored.
-func (r *abRun) waitConverged(from time.Time, excludeOld bool) {
+// reports the result as a duration from origin or as censored. Convergence is the
+// topology and serving state of abConvergenceProblems holding, then a write that started after
+// it held being acknowledged; it is reported at that acknowledgement. The writers then keep
+// running for abVerifyWindow, so that the analysis sees a completed window.
+func (r *abRun) waitConverged(from time.Time, origin string, excludeOld bool) {
 	deadline := from.Add(abObservationWindow)
 	var probs []string
+	var heldSince time.Time
 	for time.Now().Before(deadline) {
 		probs = r.abConvergenceProblems(excludeOld)
-		if len(probs) == 0 {
-			r.R.outcome("CONVERGED %.1fs after the first attempt", time.Since(from).Seconds())
-			return
+		switch {
+		case len(probs) > 0:
+			heldSince = time.Time{}
+		case heldSince.IsZero():
+			heldSince = time.Now()
+		default:
+			for _, w := range r.W.Records() {
+				if w.Acked && w.Start.After(heldSince) {
+					r.R.outcome("CONVERGED %.1fs after %s (state held from %.1fs; first write acknowledged after it)",
+						w.End.Sub(from).Seconds(), origin, heldSince.Sub(from).Seconds())
+					r.Sleep(abVerifyWindow, "writers keep running past convergence")
+					return
+				}
+			}
+			probs = []string{"no write acknowledged since the state held"}
 		}
 		time.Sleep(time.Second)
 	}
-	r.R.outcome("CENSORED: not converged %v after the first attempt; state: %s", abObservationWindow, strings.Join(probs, "; "))
+	r.R.outcome("CENSORED: not converged %v after %s; state: %s", abObservationWindow, origin, strings.Join(probs, "; "))
 }
 
 // analyze reports the reparent attempts, the overlap evidence, the restarts, the connections
@@ -856,7 +875,7 @@ func abERS(t *testing.T, name string, viaVTOrc, restarts bool) {
 		if !viaVTOrc {
 			s.setRecoveries(true)
 		}
-		r.waitConverged(r.firstAttempt, true)
+		r.waitConverged(r.firstAttempt, "the first attempt", true)
 		r.analyze()
 		r.reportErrantSettled()
 	})
@@ -902,7 +921,7 @@ func TestABE2PRS(t *testing.T) {
 		res, done := s.waitERS(prs, 240*time.Second)
 		s.R.outcome("PRS done=%v took %.1fs err=%v", done, res.end.Sub(res.start).Seconds(), res.err)
 		s.R.outcome("topo primary after the PRS: %v; vttablet types: %s", aliasOf(s.topoPrimary()), s.types())
-		r.waitConverged(r.firstAttempt, false)
+		r.waitConverged(r.firstAttempt, "the first attempt", false)
 		r.analyze()
 		r.reportErrantSettled()
 	})
@@ -975,7 +994,7 @@ func TestABE3StartupRestore(t *testing.T) {
 			s.R.violation("HARNESS: R1's finalization did not overlap the harness lock hold; do not count this run")
 		}
 		s.setRecoveries(true)
-		r.waitConverged(releasedAt, false)
+		r.waitConverged(releasedAt, "the harness released the shard lock", false)
 		tp := s.topoPrimary()
 		s.R.outcome("R1 at the end: type=%s replicating from the shard primary %s=%v; %s", s.tabletTypeHTTP(r.r1), aliasOf(tp), tp != nil && s.replicatingFrom(r.r1, tp), sv.Summary())
 		r.successAt = releasedAt

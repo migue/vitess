@@ -517,13 +517,11 @@ func (r *abRun) restart(n *Node, restore bool, prepare func(), timeout time.Dura
 // as a REPLICA of it.
 func (r *abRun) abConvergenceProblems(excludeOld bool) []string {
 	if !excludeOld {
-		p, probs := r.convergenceProblems()
+		_, probs := r.convergenceProblems()
 		// The plan's convergence includes serving, which convergenceProblems does not check.
 		for _, n := range r.Nodes {
-			if n != p {
-				if st := tabletState(n); st != "SERVING" {
-					probs = append(probs, fmt.Sprintf("%s %s", n.Tablet.Alias, st))
-				}
+			if st := tabletState(n); st != "SERVING" {
+				probs = append(probs, fmt.Sprintf("%s %s", n.Tablet.Alias, st))
 			}
 		}
 		return probs
@@ -533,8 +531,8 @@ func (r *abRun) abConvergenceProblems(excludeOld bool) []string {
 		return []string{"the shard record does not name a new primary: " + aliasOf(p)}
 	}
 	var probs []string
-	if typ := r.tabletTypeHTTP(p); typ != "PRIMARY" {
-		probs = append(probs, fmt.Sprintf("primary %s vttablet type %s", p.Tablet.Alias, typ))
+	if st, typ := tabletState(p), r.tabletTypeHTTP(p); st != "SERVING" || typ != "PRIMARY" {
+		probs = append(probs, fmt.Sprintf("primary %s %s %s", p.Tablet.Alias, typ, st))
 	}
 	for _, n := range r.Nodes {
 		if n == p || n == r.p {

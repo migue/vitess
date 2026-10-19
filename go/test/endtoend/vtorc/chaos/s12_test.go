@@ -625,7 +625,16 @@ func (s *Scenario) reportErrantDetail(label string) {
 		if n == p {
 			continue
 		}
-		errant, err := n.scalar("select gtid_subtract(@@global.gtid_executed, ?)", pg)
+		// Read the replica's set before the primary's: with the writers running, a primary set
+		// read earlier lacks the transactions the replica applied since.
+		ng, err := n.gtidExecuted()
+		if err == nil {
+			pg, err = p.gtidExecuted()
+		}
+		errant := ""
+		if err == nil {
+			errant, err = p.scalar("select gtid_subtract(?, ?)", ng, pg)
+		}
 		errant = strings.ReplaceAll(errant, "\n", "")
 		sro, _ := n.scalar("select @@global.super_read_only")
 		rs, _ := n.replicaStatus()

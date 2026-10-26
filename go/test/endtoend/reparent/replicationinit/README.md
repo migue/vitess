@@ -3,6 +3,18 @@
 End-to-end tests of replication initialization at vttablet startup and its interaction
 with reparents. VTOrc does not run unless a test starts it.
 
+The controls pass on main and show that the fixture behaves as scenarios rely on:
+
+- `TestRestartReplicaVttabletKeepsMysqld`: restart only a replica's vttablet; its mysqld and
+  replication state stay.
+- `TestShardLockControl`: hold a test-owned shard lock past its etcd lease TTL by checking it
+  periodically, and detect a lost lease.
+- `TestERSHeldByApplierBarriers`: hold a real EmergencyReparentShard after it stops the
+  replicas and before it promotes, using read locks that block the appliers of the two most
+  advanced replicas while a third replicates through one of them. Release the locks and verify
+  the promotion. ERS holds the shard lock through the hold, and nothing renews the lock's lease
+  there, so keep holds to a few seconds.
+
 Run the package through the CI entry point, keeping the data of every run:
 
 ```
